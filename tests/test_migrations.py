@@ -18,11 +18,12 @@ def test_sqlite_upgrades_from_empty_database_to_head(tmp_path, monkeypatch) -> N
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "0013"
+            ).scalar_one() == "0014"
             tables = set(inspect(connection).get_table_names())
             assert {
                 "projects", "run_specs", "secret_capability_grants",
                 "parameter_enum_sets", "automation_script_parameters",
+                "data_factory_workflows", "data_factory_runs",
             } <= tables
             run_spec_columns = {
                 column["name"]: column for column in inspect(connection).get_columns("run_specs")

@@ -135,6 +135,12 @@ pytest 与 Playwright 脚本可在表单中选择“Windows 本机执行”。�
 
 脚本中的可变入参应通过 `runner.load_parameters()` 读取，不要写死在函数调用中。例如先读取 `parameters = load_parameters()`，再将 `parameters["shopId"]`、`parameters["shopAccount"]` 等值传给业务方法。前端“测试计划”选择脚本后可填写每个脚本的执行入参 JSON；计划可通过“编辑入参”继续修改，每次保存生成新修订，历史 RunSpec 不受影响。
 
+### 数据工厂
+
+“数据工厂”提供项目级可视化接口编排，支持 HTTP 请求、条件判断和并行分支节点。节点间通过 `always`、`success`、`failure`、`true`、`false` 连线控制流转；请求 URL、请求头、Query 和 JSON Body 可使用 `{{variable}}`，响应可按简单 JSON Path（如 `$.data.id`）提取变量供后续节点使用。
+
+工作流支持单节点调试、整链执行和执行结果持久化。HTTP 请求不跟随重定向，默认超时 30 秒、响应体上限 1 MiB，并拒绝用户信息 URL 及解析到本机、私网或其他非公网地址的目标。
+
 ## 验证
 
     .\.venv\Scripts\python.exe -m pytest tests -q

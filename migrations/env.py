@@ -16,10 +16,15 @@ from services.api.environment_models import (
     EnvironmentRevisionModel,
     EnvironmentValueModel,
 )
+from services.api.data_factory_models import (
+    DataFactoryRunModel,
+    DataFactoryWorkflowModel,
+)
 from services.api.parameter_models import (
     AutomationScriptParameterModel,
     ParameterEnumSetModel,
 )
+from services.api.project_models import ProjectModel
 from services.api.quality_models import (
     RequirementModel,
     RequirementRevisionModel,
@@ -47,8 +52,10 @@ _registered_models = (
     AutomationScriptModel, AutomationScriptRevisionModel, TestCaseScriptLinkModel,
     EnvironmentModel, EnvironmentRevisionModel, EnvironmentValueModel,
     ParameterEnumSetModel, AutomationScriptParameterModel,
+    ProjectModel,
     SecretCapabilityGrantModel,
     TestPlanModel, TestPlanRevisionModel, ExecutionBatchModel, RunSpecModel,
+    DataFactoryWorkflowModel, DataFactoryRunModel,
 )
 
 

@@ -7,6 +7,7 @@ export type NavKey =
   | 'executions'
   | 'defects'
   | 'reports'
+  | 'data-factory'
   | 'version-control'
 
 export type IconName = NavKey | 'menu' | 'bell' | 'refresh' | 'search' | 'close'
@@ -79,5 +80,6 @@ export const navigationItems: NavigationItem[] = [
   { key: 'executions', label: '执行中心', icon: 'executions' },
   { key: 'defects', label: '缺陷管理', icon: 'defects' },
   { key: 'reports', label: '测试报告', icon: 'reports' },
+  { key: 'data-factory', label: '数据工厂', icon: 'data-factory' },
   { key: 'version-control', label: '代码版本', icon: 'version-control' },
 ]

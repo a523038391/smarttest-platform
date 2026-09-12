@@ -32,6 +32,9 @@ defineProps<{ name: IconName }>()
     <template v-else-if="name === 'reports'">
       <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />
     </template>
+    <template v-else-if="name === 'data-factory'">
+      <ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" />
+    </template>
     <template v-else-if="name === 'version-control'">
       <circle cx="6" cy="5" r="2" /><circle cx="6" cy="19" r="2" /><circle cx="18" cy="8" r="2" />
       <path d="M6 7v10M8 8h4a6 6 0 0 1 6 6v-4" />

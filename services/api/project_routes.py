@@ -80,11 +80,12 @@ def delete_project(
         request.app.state.parameter_repository.list_enum_sets(project_id),
         request.app.state.environment_repository.list_environments(project_id),
         request.app.state.test_plan_repository.list_plans(project_id),
+        request.app.state.data_factory_repository.list_workflows(project_id),
     )
     if any(project_content):
         raise ProjectInUse(
             "project contains requirements, test cases, scripts, parameter enums, "
-            "environments, or test plans"
+            "environments, test plans, or data factory workflows"
         )
     repository.delete_project(project_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

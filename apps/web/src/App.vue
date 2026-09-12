@@ -5,6 +5,7 @@ import AppSidebar from './components/AppSidebar.vue'
 import AuthView from './components/AuthView.vue'
 import AutomationView from './components/AutomationView.vue'
 import DashboardView from './components/DashboardView.vue'
+import DataFactoryView from './components/DataFactoryView.vue'
 import ExecutionCenter from './components/ExecutionCenter.vue'
 import PlaceholderView from './components/PlaceholderView.vue'
 import TestPlanView from './components/TestPlanView.vue'
@@ -219,6 +220,12 @@ onBeforeUnmount(() => {
           :projects-loading="projectsLoading"
           :projects-error="projectsError"
           @executed="handlePlanExecuted"
+        />
+        <DataFactoryView
+          v-else-if="activePage === 'data-factory'"
+          :project-id="selectedProjectId"
+          :projects-loading="projectsLoading"
+          :projects-error="projectsError"
         />
         <VersionControlView v-else-if="activePage === 'version-control'" />
         <PlaceholderView v-else :title="pageTitle" />

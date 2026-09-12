@@ -45,6 +45,14 @@ from .dispatcher import (
     DispatchUnavailable,
     RunDispatcher,
 )
+from .data_factory_domain import WorkflowValidationError
+from .data_factory_executor import DataFactoryExecutor, WorkflowExecutionError
+from .data_factory_repository import (
+    DataFactoryRepository, WorkflowConflict, WorkflowNameConflict,
+    WorkflowNotFound, WorkflowVersionConflict,
+)
+from .data_factory_routes import data_factory_router
+from .data_factory_sql_repository import SqlDataFactoryRepository
 from .domain import InvalidTransition
 from .environment_crypto import (
     SecretDecryptionError,
@@ -181,6 +189,8 @@ def create_app(
     parameter_repository: ParameterRepository | SqlParameterRepository | None = None,
     version_control_service: VersionControlService | None = None,
     service_control_service: ServiceControlService | None = None,
+    data_factory_repository: DataFactoryRepository | SqlDataFactoryRepository | None = None,
+    data_factory_executor: DataFactoryExecutor | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     database_engine = None
@@ -189,7 +199,7 @@ def create_app(
         repository is None or quality_repository is None or automation_repository is None
         or environment_repository is None or test_plan_repository is None
         or auth_repository is None or project_repository is None
-        or parameter_repository is None
+        or parameter_repository is None or data_factory_repository is None
     ):
         database_engine = create_database_engine(resolved_settings.database_url)
         sessions = create_session_factory(database_engine)
@@ -233,6 +243,11 @@ def create_app(
         project_repository = (
             SqlProjectRepository(sessions) if sessions else ProjectRepository()
         )
+    if data_factory_repository is None:
+        data_factory_repository = (
+            SqlDataFactoryRepository(sessions) if sessions else DataFactoryRepository()
+        )
+    data_factory_executor = data_factory_executor or DataFactoryExecutor()
     if resolved_settings.auto_dispatch and dispatcher is None:
         if resolved_settings.local_runner_enabled:
             dispatcher = DatabaseRunDispatcher(repository)
@@ -313,6 +328,8 @@ def create_app(
     application.state.auth_repository = auth_repository
     application.state.login_throttle = LoginThrottle()
     application.state.project_repository = project_repository
+    application.state.data_factory_repository = data_factory_repository
+    application.state.data_factory_executor = data_factory_executor
     application.state.version_control_service = version_control_service
     application.state.service_control_service = service_control_service
 
@@ -342,6 +359,7 @@ def create_app(
     application.include_router(health_router)
     application.include_router(auth_router)
     application.include_router(project_router)
+    application.include_router(data_factory_router)
     application.include_router(runs_router)
     application.include_router(requirements_router)
     application.include_router(test_cases_router)
@@ -402,6 +420,37 @@ def create_app(
         request: Request, exc: ProjectNotFound
     ) -> JSONResponse:
         return _problem(request, 404, "project_not_found", str(exc))
+
+    @application.exception_handler(WorkflowNotFound)
+    async def workflow_not_found_handler(
+        request: Request, exc: WorkflowNotFound
+    ) -> JSONResponse:
+        return _problem(request, 404, "workflow_not_found", str(exc))
+
+    @application.exception_handler(WorkflowNameConflict)
+    async def workflow_name_conflict_handler(
+        request: Request, exc: WorkflowNameConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "workflow_name_conflict", str(exc))
+
+    @application.exception_handler(WorkflowVersionConflict)
+    async def workflow_version_conflict_handler(
+        request: Request, exc: WorkflowVersionConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "workflow_version_conflict", str(exc))
+
+    @application.exception_handler(WorkflowConflict)
+    async def workflow_conflict_handler(
+        request: Request, exc: WorkflowConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "workflow_conflict", str(exc))
+
+    @application.exception_handler(WorkflowValidationError)
+    @application.exception_handler(WorkflowExecutionError)
+    async def workflow_invalid_handler(
+        request: Request, exc: WorkflowValidationError | WorkflowExecutionError
+    ) -> JSONResponse:
+        return _problem(request, 422, "workflow_invalid", str(exc))
 
     @application.exception_handler(ProjectNameConflict)
     async def project_name_conflict_handler(
