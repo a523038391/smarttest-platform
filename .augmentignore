@@ -1,0 +1,26 @@
+# >>> Auggie Desktop: auto-managed ignores (do not edit) >>>
+*.log
+*.map
+*.min.js
+.cache/
+.mypy_cache/
+.next/
+.nuxt/
+.parcel-cache/
+.pytest_cache/
+.svelte-kit/
+.turbo/
+.venv/
+.vite/
+__pycache__/
+build/
+coverage/
+dist/
+node_modules/
+out/
+package-lock.json
+pnpm-lock.yaml
+target/
+venv/
+yarn.lock
+# <<< Auggie Desktop: auto-managed ignores <<<

@@ -1,0 +1,35 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.artifacts/
+.host-smoke-spool/
+.runner-smoke-*/
+.runner-work/
+.sources/
+.runner-spool/
+.mypy_cache/
+coverage/
+.coverage
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.log
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
