@@ -32,6 +32,10 @@ defineProps<{ name: IconName }>()
     <template v-else-if="name === 'reports'">
       <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />
     </template>
+    <template v-else-if="name === 'version-control'">
+      <circle cx="6" cy="5" r="2" /><circle cx="6" cy="19" r="2" /><circle cx="18" cy="8" r="2" />
+      <path d="M6 7v10M8 8h4a6 6 0 0 1 6 6v-4" />
+    </template>
     <template v-else-if="name === 'menu'"><path d="M4 7h16M4 12h16M4 17h16" /></template>
     <template v-else-if="name === 'bell'"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></template>
     <template v-else-if="name === 'refresh'"><path d="M20 6v5h-5M4 18v-5h5" /><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5" /></template>

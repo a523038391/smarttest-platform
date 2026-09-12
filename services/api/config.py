@@ -57,6 +57,8 @@ class Settings:
     auth_required: bool = True
     session_cookie_secure: bool = False
     session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS
+    version_control_enabled: bool = False
+    version_control_root: str | None = None
 
     def __post_init__(self) -> None:
         configured_text = {
@@ -121,6 +123,17 @@ class Settings:
         if not 1 <= self.session_ttl_seconds <= MAX_SESSION_TTL_SECONDS:
             raise ValueError(
                 f"SESSION_TTL_SECONDS must be between 1 and {MAX_SESSION_TTL_SECONDS}"
+            )
+        if self.version_control_enabled and (
+            not self.version_control_root
+            or not isinstance(self.version_control_root, str)
+            or self.version_control_root != self.version_control_root.strip()
+            or any(ord(character) < 32 for character in self.version_control_root)
+            or not Path(self.version_control_root).is_absolute()
+        ):
+            raise ValueError(
+                "VERSION_CONTROL_ROOT must be an absolute directory when version control "
+                "is enabled"
             )
 
     @classmethod
@@ -187,5 +200,9 @@ class Settings:
             session_cookie_secure=_boolean(env, "SESSION_COOKIE_SECURE", False),
             session_ttl_seconds=int(
                 env.get("SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL_SECONDS)
+            ),
+            version_control_enabled=_boolean(env, "VERSION_CONTROL_ENABLED", False),
+            version_control_root=(
+                env.get("VERSION_CONTROL_ROOT", "").strip() or None
             ),
         )

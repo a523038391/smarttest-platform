@@ -119,6 +119,19 @@ from .test_plan_routes import (
     test_plans_router,
 )
 from .test_plan_sql_repository import SqlTestPlanRepository
+from .version_control_routes import version_control_router
+from .version_control_service import (
+    DetachedHead,
+    DirtyWorkingTree,
+    GitOperationFailed,
+    GitOperationTimedOut,
+    RemoteUnavailable,
+    RepositoryUnavailable,
+    SensitiveFilesStaged,
+    VersionControlDisabled,
+    VersionControlForbidden,
+    VersionControlService,
+)
 
 
 def _problem(
@@ -160,6 +173,7 @@ def create_app(
     executor_factory: ExecutorFactory | None = None,
     host_executor_factory: HostExecutorFactory | None = None,
     parameter_repository: ParameterRepository | SqlParameterRepository | None = None,
+    version_control_service: VersionControlService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     database_engine = None
@@ -245,6 +259,10 @@ def create_app(
             host_executor_factory=host_executor_factory,
         )
     case_generator = case_generator or AiCaseGenerator()
+    version_control_service = version_control_service or VersionControlService(
+        resolved_settings.version_control_enabled,
+        resolved_settings.version_control_root,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -283,6 +301,7 @@ def create_app(
     application.state.auth_repository = auth_repository
     application.state.login_throttle = LoginThrottle()
     application.state.project_repository = project_repository
+    application.state.version_control_service = version_control_service
 
     @application.middleware("http")
     async def authentication_middleware(request: Request, call_next):
@@ -323,6 +342,7 @@ def create_app(
     application.include_router(test_plans_router)
     application.include_router(execution_batches_router)
     application.include_router(run_specs_router)
+    application.include_router(version_control_router)
 
     @application.exception_handler(RequestValidationError)
     async def validation_handler(
@@ -603,6 +623,60 @@ def create_app(
         return _problem(
             request, 503, "dispatch_unavailable", "Run dispatch is unavailable"
         )
+
+    @application.exception_handler(VersionControlForbidden)
+    async def version_control_forbidden_handler(
+        request: Request, _: VersionControlForbidden
+    ) -> JSONResponse:
+        return _problem(request, 403, "version_control_forbidden", "Administrator access required")
+
+    @application.exception_handler(VersionControlDisabled)
+    async def version_control_disabled_handler(
+        request: Request, _: VersionControlDisabled
+    ) -> JSONResponse:
+        return _problem(request, 503, "version_control_disabled", "Version control is disabled")
+
+    @application.exception_handler(RepositoryUnavailable)
+    async def repository_unavailable_handler(
+        request: Request, _: RepositoryUnavailable
+    ) -> JSONResponse:
+        return _problem(request, 409, "repository_unavailable", "Configured repository is unavailable")
+
+    @application.exception_handler(RemoteUnavailable)
+    async def remote_unavailable_handler(
+        request: Request, _: RemoteUnavailable
+    ) -> JSONResponse:
+        return _problem(request, 409, "remote_unavailable", "The origin remote is not configured")
+
+    @application.exception_handler(DirtyWorkingTree)
+    async def dirty_working_tree_handler(
+        request: Request, _: DirtyWorkingTree
+    ) -> JSONResponse:
+        return _problem(request, 409, "dirty_working_tree", "Working tree must be clean before pull")
+
+    @application.exception_handler(DetachedHead)
+    async def detached_head_handler(
+        request: Request, _: DetachedHead
+    ) -> JSONResponse:
+        return _problem(request, 409, "detached_head", "Repository has no current branch")
+
+    @application.exception_handler(SensitiveFilesStaged)
+    async def sensitive_files_handler(
+        request: Request, _: SensitiveFilesStaged
+    ) -> JSONResponse:
+        return _problem(request, 422, "sensitive_files_staged", "Sensitive files cannot be published")
+
+    @application.exception_handler(GitOperationTimedOut)
+    async def git_timeout_handler(
+        request: Request, _: GitOperationTimedOut
+    ) -> JSONResponse:
+        return _problem(request, 504, "git_operation_timed_out", "Version control operation timed out")
+
+    @application.exception_handler(GitOperationFailed)
+    async def git_failed_handler(
+        request: Request, _: GitOperationFailed
+    ) -> JSONResponse:
+        return _problem(request, 502, "git_operation_failed", "Version control operation failed")
 
     @application.exception_handler(HTTPException)
     async def http_handler(request: Request, exc: HTTPException) -> JSONResponse:

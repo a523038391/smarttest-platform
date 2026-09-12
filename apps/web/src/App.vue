@@ -8,6 +8,7 @@ import DashboardView from './components/DashboardView.vue'
 import ExecutionCenter from './components/ExecutionCenter.vue'
 import PlaceholderView from './components/PlaceholderView.vue'
 import TestPlanView from './components/TestPlanView.vue'
+import VersionControlView from './components/VersionControlView.vue'
 import { fetchAuthStatus, getAuthErrorMessage, logout } from './services/auth'
 import {
   createProject as createProjectApi,
@@ -219,6 +220,7 @@ onBeforeUnmount(() => {
           :projects-error="projectsError"
           @executed="handlePlanExecuted"
         />
+        <VersionControlView v-else-if="activePage === 'version-control'" />
         <PlaceholderView v-else :title="pageTitle" />
       </main>
     </div>
