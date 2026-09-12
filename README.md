@@ -106,6 +106,10 @@ Vite 默认代理 `/api` 与 `/health` 到 `http://127.0.0.1:8000`，可通过 `
 
     .\.venv\Scripts\python.exe scripts\platform_supervisor.py
 
+需要关闭当前终端后仍保持运行时，使用内置脱离终端启动脚本。它继承当前终端中的数据库及 Runner 环境变量，且不会输出这些值：
+
+    powershell -ExecutionPolicy Bypass -File .\scripts\start_platform.ps1
+
 守护脚本固定从仓库根启动后端 `.venv\Scripts\python.exe -m uvicorn services.api.app:app --host 127.0.0.1 --port 8000`，并从 `apps/web` 启动 `npm.cmd run dev -- --host 127.0.0.1`。子进程异常退出会自动拉起，按 `Ctrl+C` 会清理前后端进程树。脚本自动创建 `.service-control` 并向子进程注入 `SERVICE_CONTROL_ENABLED=true`、绝对 `SERVICE_CONTROL_ROOT` 和 `VERSION_CONTROL_AUTO_RESTART=true`，无需手工设置这些变量。
 
 `/api/v1/service-control/*` 仅允许管理员访问；`AUTH_REQUIRED=false` 只为隔离的本地开发和自动化测试兼容。API 只接受 `frontend`、`backend`、`all` 三个固定目标，不接受命令、PID、工作目录或路径。控制文件最大 4 KiB，使用固定 schema 和原子替换，心跳超过 5 秒即判定守护离线。Web/API 不能修改守护脚本的固定启动命令；不要将服务控制目录放在共享或不受信任的位置，也不要在生产或多用户主机上启用此本地开发能力。
