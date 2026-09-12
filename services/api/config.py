@@ -59,6 +59,9 @@ class Settings:
     session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS
     version_control_enabled: bool = False
     version_control_root: str | None = None
+    service_control_enabled: bool = False
+    service_control_root: str | None = None
+    version_control_auto_restart: bool = False
 
     def __post_init__(self) -> None:
         configured_text = {
@@ -135,6 +138,21 @@ class Settings:
                 "VERSION_CONTROL_ROOT must be an absolute directory when version control "
                 "is enabled"
             )
+        if self.service_control_enabled and (
+            not self.service_control_root
+            or not isinstance(self.service_control_root, str)
+            or self.service_control_root != self.service_control_root.strip()
+            or any(ord(character) < 32 for character in self.service_control_root)
+            or not Path(self.service_control_root).is_absolute()
+        ):
+            raise ValueError(
+                "SERVICE_CONTROL_ROOT must be an absolute directory when service control "
+                "is enabled"
+            )
+        if self.version_control_auto_restart and not self.service_control_enabled:
+            raise ValueError(
+                "VERSION_CONTROL_AUTO_RESTART requires SERVICE_CONTROL_ENABLED=true"
+            )
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -204,5 +222,12 @@ class Settings:
             version_control_enabled=_boolean(env, "VERSION_CONTROL_ENABLED", False),
             version_control_root=(
                 env.get("VERSION_CONTROL_ROOT", "").strip() or None
+            ),
+            service_control_enabled=_boolean(env, "SERVICE_CONTROL_ENABLED", False),
+            service_control_root=(
+                env.get("SERVICE_CONTROL_ROOT", "").strip() or None
+            ),
+            version_control_auto_restart=_boolean(
+                env, "VERSION_CONTROL_AUTO_RESTART", False
             ),
         )

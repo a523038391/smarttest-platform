@@ -9,6 +9,7 @@ __pycache__/
 .runner-work/
 .sources/
 .runner-spool/
+.service-control/
 .mypy_cache/
 coverage/
 .coverage

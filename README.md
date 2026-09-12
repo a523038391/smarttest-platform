@@ -100,6 +100,18 @@ Windows 本地调试可在 Worker 命令末尾添加 `--pool=solo`。当 `AUTO_D
 
 Vite 默认代理 `/api` 与 `/health` 到 `http://127.0.0.1:8000`，可通过 `VITE_API_TARGET` 修改。
 
+### Windows 本地服务守护
+
+完成虚拟环境依赖和 `apps/web` 的 npm 依赖安装后，可在仓库根目录用一个终端同时守护前后端：
+
+    .\.venv\Scripts\python.exe scripts\platform_supervisor.py
+
+守护脚本固定从仓库根启动后端 `.venv\Scripts\python.exe -m uvicorn services.api.app:app --host 127.0.0.1 --port 8000`，并从 `apps/web` 启动 `npm.cmd run dev -- --host 127.0.0.1`。子进程异常退出会自动拉起，按 `Ctrl+C` 会清理前后端进程树。脚本自动创建 `.service-control` 并向子进程注入 `SERVICE_CONTROL_ENABLED=true`、绝对 `SERVICE_CONTROL_ROOT` 和 `VERSION_CONTROL_AUTO_RESTART=true`，无需手工设置这些变量。
+
+`/api/v1/service-control/*` 仅允许管理员访问；`AUTH_REQUIRED=false` 只为隔离的本地开发和自动化测试兼容。API 只接受 `frontend`、`backend`、`all` 三个固定目标，不接受命令、PID、工作目录或路径。控制文件最大 4 KiB，使用固定 schema 和原子替换，心跳超过 5 秒即判定守护离线。Web/API 不能修改守护脚本的固定启动命令；不要将服务控制目录放在共享或不受信任的位置，也不要在生产或多用户主机上启用此本地开发能力。
+
+启用版本管理且由守护脚本启动时，成功的 pull/publish 会尽力调度前后端在 2 秒后重启，并通过响应的 `restart_scheduled` 表示是否已成功写入请求；守护离线不会回滚或改变已成功的 Git 操作结果。
+
 ### 导入自动化项目
 
 “自动化脚本”支持三种源码来源：直接粘贴单个 Python 文件、上传完整项目 ZIP、导入公开 HTTPS Git 仓库。ZIP 根目录应直接包含入口文件及依赖模块，入口使用 POSIX 相对路径（例如 `tests/test_login.py`）。ZIP 压缩包最大 10 MiB、解压后最大 50 MiB、最多 2000 个文件；路径穿越、符号链接、加密包和大小写冲突路径会被拒绝。

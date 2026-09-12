@@ -1,4 +1,6 @@
+import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -7,7 +9,11 @@ from fastapi.testclient import TestClient
 from services.api.app import create_app
 from services.api.auth_repository import MemoryAuthRepository
 from services.api.config import Settings
-from services.api.version_control_service import VersionControlService
+from services.api.service_control_service import ServiceControlService
+from services.api.version_control_service import (
+    VersionControlService,
+    VersionControlStatus,
+)
 
 
 def _git(cwd: Path, *arguments: str) -> str:
@@ -73,6 +79,7 @@ def test_settings_and_disabled_endpoints(tmp_path) -> None:
         "change_count": 0,
         "changed_paths": [],
         "remote_configured": False,
+        "restart_scheduled": False,
     }
     pull = client.post("/api/v1/version-control/pull")
     assert pull.status_code == 503
@@ -201,3 +208,75 @@ def test_publish_rejects_multiline_commit_message(git_repositories) -> None:
 
     assert response.status_code == 422
     assert response.json()["code"] == "validation_error"
+
+
+class _SuccessfulVersionControlService:
+    def _result(self) -> VersionControlStatus:
+        return VersionControlStatus(True, True, "main", "abcdef123456", True, 0, (), True)
+
+    def status(self) -> VersionControlStatus:
+        return self._result()
+
+    def pull(self) -> VersionControlStatus:
+        return self._result()
+
+    def publish(self, commit_message: str) -> VersionControlStatus:
+        assert commit_message == "publish"
+        return self._result()
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/v1/version-control/pull", None),
+        ("/api/v1/version-control/publish", {"commit_message": "publish"}),
+    ],
+)
+def test_successful_git_operation_schedules_all_restart(tmp_path, path, payload) -> None:
+    now = datetime.now(timezone.utc)
+    (tmp_path / "heartbeat.json").write_text(json.dumps({
+        "schema_version": 1, "heartbeat_at": now.isoformat(),
+    }), encoding="utf-8")
+    settings = Settings(
+        auth_required=False,
+        service_control_enabled=True,
+        service_control_root=str(tmp_path.resolve()),
+        version_control_auto_restart=True,
+    )
+    client = TestClient(create_app(
+        settings=settings,
+        version_control_service=_SuccessfulVersionControlService(),  # type: ignore[arg-type]
+        service_control_service=ServiceControlService(
+            True,
+            str(tmp_path),
+            auto_restart_enabled=True,
+            clock=lambda: now,
+        ),
+    ))
+
+    response = client.post(path, json=payload) if payload else client.post(path)
+
+    assert response.status_code == 200
+    assert response.json()["restart_scheduled"] is True
+    request = json.loads((tmp_path / "restart-request.json").read_text(encoding="utf-8"))
+    assert request["target"] == "all"
+
+
+def test_offline_supervisor_does_not_fail_successful_git_operation(tmp_path) -> None:
+    settings = Settings(
+        auth_required=False,
+        service_control_enabled=True,
+        service_control_root=str(tmp_path.resolve()),
+        version_control_auto_restart=True,
+    )
+    client = TestClient(create_app(
+        settings=settings,
+        version_control_service=_SuccessfulVersionControlService(),  # type: ignore[arg-type]
+    ))
+
+    response = client.post(
+        "/api/v1/version-control/publish", json={"commit_message": "publish"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["restart_scheduled"] is False

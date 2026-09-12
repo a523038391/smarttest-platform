@@ -28,7 +28,8 @@ function parseStatus(value: unknown): VersionControlStatus | null {
     || (value.change_count as number) < 0
     || !Array.isArray(value.changed_paths)
     || !value.changed_paths.every((path) => typeof path === 'string')
-    || typeof value.remote_configured !== 'boolean') return null
+    || typeof value.remote_configured !== 'boolean'
+    || typeof value.restart_scheduled !== 'boolean') return null
 
   return {
     enabled: value.enabled,
@@ -39,6 +40,7 @@ function parseStatus(value: unknown): VersionControlStatus | null {
     change_count: value.change_count as number,
     changed_paths: value.changed_paths,
     remote_configured: value.remote_configured,
+    restart_scheduled: value.restart_scheduled,
   }
 }
 
@@ -52,6 +54,8 @@ const CODE_MESSAGES: Record<string, string> = {
   sensitive_files_staged: '检测到敏感配置、密钥、数据库或备份文件，已停止上传并撤销暂存。',
   git_operation_timed_out: 'Git 操作超时，请检查网络后重试。',
   git_operation_failed: 'Git 操作失败，请检查远程仓库权限、网络和本机凭据。',
+  service_control_forbidden: '仅管理员可以控制平台服务。',
+  service_control_unavailable: '服务守护进程当前不可用，请联系管理员检查守护进程状态。',
 }
 
 async function createHttpError(response: Response): Promise<Error> {

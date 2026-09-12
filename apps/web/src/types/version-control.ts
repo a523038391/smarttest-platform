@@ -7,6 +7,7 @@ export interface VersionControlStatus {
   change_count: number
   changed_paths: string[]
   remote_configured: boolean
+  restart_scheduled: boolean
 }
 
 export interface VersionControlPublishInput {

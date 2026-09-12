@@ -13,10 +13,15 @@ class VersionControlStatusResponse(ApiModel):
     change_count: int
     changed_paths: list[str]
     remote_configured: bool
+    restart_scheduled: bool = False
 
     @classmethod
-    def from_record(cls, status: VersionControlStatus) -> "VersionControlStatusResponse":
-        return cls.model_validate(status, from_attributes=True)
+    def from_record(
+        cls, status: VersionControlStatus, *, restart_scheduled: bool = False,
+    ) -> "VersionControlStatusResponse":
+        return cls.model_validate(status, from_attributes=True).model_copy(
+            update={"restart_scheduled": restart_scheduled}
+        )
 
 
 class PublishRequest(ApiModel):

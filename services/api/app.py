@@ -103,6 +103,12 @@ from .repository import (
 )
 from .routes import health_router, runs_router
 from .schemas import Problem, ValidationErrorDetail
+from .service_control_routes import service_control_router
+from .service_control_service import (
+    ServiceControlForbidden,
+    ServiceControlService,
+    ServiceControlUnavailable,
+)
 from .sql_repository import SqlRunRepository
 from .test_plan_domain import InvalidTestPlanTransition
 from .test_plan_repository import (
@@ -174,6 +180,7 @@ def create_app(
     host_executor_factory: HostExecutorFactory | None = None,
     parameter_repository: ParameterRepository | SqlParameterRepository | None = None,
     version_control_service: VersionControlService | None = None,
+    service_control_service: ServiceControlService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     database_engine = None
@@ -259,6 +266,11 @@ def create_app(
             host_executor_factory=host_executor_factory,
         )
     case_generator = case_generator or AiCaseGenerator()
+    service_control_service = service_control_service or ServiceControlService(
+        resolved_settings.service_control_enabled,
+        resolved_settings.service_control_root,
+        auto_restart_enabled=resolved_settings.version_control_auto_restart,
+    )
     version_control_service = version_control_service or VersionControlService(
         resolved_settings.version_control_enabled,
         resolved_settings.version_control_root,
@@ -302,6 +314,7 @@ def create_app(
     application.state.login_throttle = LoginThrottle()
     application.state.project_repository = project_repository
     application.state.version_control_service = version_control_service
+    application.state.service_control_service = service_control_service
 
     @application.middleware("http")
     async def authentication_middleware(request: Request, call_next):
@@ -343,6 +356,7 @@ def create_app(
     application.include_router(execution_batches_router)
     application.include_router(run_specs_router)
     application.include_router(version_control_router)
+    application.include_router(service_control_router)
 
     @application.exception_handler(RequestValidationError)
     async def validation_handler(
@@ -629,6 +643,23 @@ def create_app(
         request: Request, _: VersionControlForbidden
     ) -> JSONResponse:
         return _problem(request, 403, "version_control_forbidden", "Administrator access required")
+
+    @application.exception_handler(ServiceControlForbidden)
+    async def service_control_forbidden_handler(
+        request: Request, _: ServiceControlForbidden
+    ) -> JSONResponse:
+        return _problem(
+            request, 403, "service_control_forbidden", "Administrator access required"
+        )
+
+    @application.exception_handler(ServiceControlUnavailable)
+    async def service_control_unavailable_handler(
+        request: Request, _: ServiceControlUnavailable
+    ) -> JSONResponse:
+        return _problem(
+            request, 503, "service_control_unavailable",
+            "Service supervisor is unavailable",
+        )
 
     @application.exception_handler(VersionControlDisabled)
     async def version_control_disabled_handler(
