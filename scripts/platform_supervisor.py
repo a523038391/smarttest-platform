@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import socket
 import stat
 import subprocess
 import time
@@ -117,7 +118,7 @@ class PlatformSupervisor:
             ],
             "frontend": [
                 "cmd.exe", "/d", "/s", "/c", "npm.cmd", "run", "dev", "--",
-                "--host", "127.0.0.1",
+                "--host", "127.0.0.1", "--strictPort",
             ],
         }
         self._working_directories = {
@@ -167,6 +168,21 @@ class PlatformSupervisor:
             raise RuntimeError(f"backend Python executable not found: {python}")
         if not self._working_directories["frontend"].is_dir():
             raise RuntimeError("apps/web directory not found")
+        self._require_available_ports()
+
+    @staticmethod
+    def _require_available_ports() -> None:
+        occupied = []
+        for port in (8000, 5173):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                occupied.append(str(port))
+            finally:
+                probe.close()
+        if occupied:
+            raise RuntimeError(f"platform ports already in use: {', '.join(occupied)}")
 
     def _write_heartbeat(self) -> None:
         _atomic_write(self._heartbeat_path, {

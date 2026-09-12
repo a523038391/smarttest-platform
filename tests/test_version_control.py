@@ -13,6 +13,7 @@ from services.api.service_control_service import ServiceControlService
 from services.api.version_control_service import (
     VersionControlService,
     VersionControlStatus,
+    _normalize_windows_proxy,
 )
 
 
@@ -85,6 +86,20 @@ def test_settings_and_disabled_endpoints(tmp_path) -> None:
     assert pull.status_code == 503
     assert pull.headers["content-type"].startswith("application/problem+json")
     assert pull.json()["code"] == "version_control_disabled"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("127.0.0.1:7890", "http://127.0.0.1:7890"),
+        ("http=127.0.0.1:7890;https=127.0.0.1:7891", "http://127.0.0.1:7891"),
+        ("https://proxy.example:443", "https://proxy.example:443"),
+        ("user:password@proxy.example:8080", None),
+        ("not a proxy", None),
+    ],
+)
+def test_windows_proxy_normalization_is_safe(raw, expected) -> None:
+    assert _normalize_windows_proxy(raw) == expected
 
 
 def test_status_reports_only_safe_bounded_repository_metadata(git_repositories) -> None:

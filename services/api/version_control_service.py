@@ -3,6 +3,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 
 GIT_TIMEOUT_SECONDS = 30.0
@@ -14,6 +15,49 @@ SENSITIVE_SUFFIXES = {
     ".sqlite-wal", ".sqlite3", ".sqlite3-shm", ".sqlite3-wal",
 }
 SENSITIVE_KEY_NAMES = {"id_dsa", "id_ecdsa", "id_ed25519", "id_rsa"}
+
+
+def _normalize_windows_proxy(raw_value: str) -> str | None:
+    raw = raw_value.strip()
+    if not raw or any(character.isspace() for character in raw):
+        return None
+    if "=" in raw:
+        entries = {}
+        for part in raw.split(";"):
+            key, separator, value = part.partition("=")
+            if separator and key.strip() and value.strip():
+                entries[key.strip().lower()] = value.strip()
+        raw = entries.get("https") or entries.get("http") or ""
+    if not raw or "@" in raw:
+        return None
+    candidate = raw if "://" in raw else f"http://{raw}"
+    try:
+        parsed = urlsplit(candidate)
+        parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https", "socks5"} or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    return candidate
+
+
+def _windows_system_proxy() -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled = winreg.QueryValueEx(key, "ProxyEnable")[0]
+            raw = winreg.QueryValueEx(key, "ProxyServer")[0]
+    except (ImportError, OSError):
+        return None
+    return _normalize_windows_proxy(raw) if enabled == 1 and isinstance(raw, str) else None
 
 
 class VersionControlError(RuntimeError):
@@ -201,6 +245,10 @@ class VersionControlService:
         environment = os.environ.copy()
         environment["GIT_TERMINAL_PROMPT"] = "0"
         environment["GCM_INTERACTIVE"] = "Never"
+        proxy = _windows_system_proxy()
+        if proxy is not None:
+            environment["HTTP_PROXY"] = proxy
+            environment["HTTPS_PROXY"] = proxy
         try:
             result = subprocess.run(
                 ["git", *arguments], cwd=str(self._root), env=environment,

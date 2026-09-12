@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from scripts.platform_supervisor import parse_control_request
+from scripts.platform_supervisor import PlatformSupervisor, parse_control_request
 from services.api.app import create_app
 from services.api.auth_repository import MemoryAuthRepository
 from services.api.config import Settings
@@ -38,6 +38,11 @@ def test_service_control_settings_defaults_environment_and_validation(tmp_path) 
         Settings(service_control_enabled=True, service_control_root="relative")
     with pytest.raises(ValueError, match="VERSION_CONTROL_AUTO_RESTART"):
         Settings(version_control_auto_restart=True)
+
+
+def test_supervisor_uses_fixed_frontend_port(tmp_path) -> None:
+    supervisor = PlatformSupervisor(tmp_path)
+    assert "--strictPort" in supervisor._commands["frontend"]
 
 
 def test_fresh_and_expired_heartbeat_are_bounded_and_type_safe(tmp_path) -> None:
