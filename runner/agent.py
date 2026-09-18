@@ -60,17 +60,25 @@ class RunnerAgent:
         heartbeat = Thread(target=self._heartbeat_loop, daemon=True)
         heartbeat.start()
         try:
-            result = self.adapters[self.task.engine].run(self.task, self.workspace)
+            adapter = self.adapters[self.task.engine]
+            run_streaming = getattr(adapter, "run_streaming", None)
+            streamed_output = callable(run_streaming)
+            result = (
+                run_streaming(self.task, self.workspace, self._emit_output)
+                if streamed_output
+                else adapter.run(self.task, self.workspace)
+            )
         except Exception as exc:  # Adapter boundaries must become protocol results.
+            streamed_output = False
             result = AdapterResult(
                 ResultOutcome.INFRA_ERROR,
                 "Adapter raised an unexpected error",
                 {"error_type": type(exc).__name__},
             )
         try:
-            if result.stdout:
+            if result.stdout and not streamed_output:
                 self._emit(EventType.LOG, {"stream": "stdout", "message": result.stdout})
-            if result.stderr:
+            if result.stderr and not streamed_output:
                 self._emit(EventType.LOG, {"stream": "stderr", "message": result.stderr})
             self._emit_artifacts()
             assertion_results = result.details.get("assertions")
@@ -125,6 +133,10 @@ class RunnerAgent:
             )
             self.event_sink(event)
             self._seq += 1
+
+    def _emit_output(self, stream: str, message: str) -> None:
+        if message:
+            self._emit(EventType.LOG, {"stream": stream, "message": message})
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self.heartbeat_interval):

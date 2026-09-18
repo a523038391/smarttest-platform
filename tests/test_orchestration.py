@@ -11,6 +11,7 @@ from services.api.app import create_app
 from services.api.config import DEFAULT_REDIS_URL, Settings
 from services.api.dispatcher import CeleryRunDispatcher, DatabaseRunDispatcher
 from services.api.domain import InvalidTransition, RunState
+from services.api.load_test_repository import LoadTestRepository
 from services.api.repository import RunRepository
 from services.api.sql_repository import SqlRunRepository
 from workers.celery_app import celery_app, create_celery_app
@@ -80,7 +81,7 @@ def test_create_app_selects_repository_and_disposes_sql_engine(monkeypatch) -> N
     monkeypatch.setattr("services.api.app.create_database_engine", lambda _: engine)
     monkeypatch.setattr("services.api.app.create_session_factory", lambda _: sessions)
     monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///runs.db")
-    app = create_app()
+    app = create_app(load_test_repository=LoadTestRepository())
 
     assert isinstance(app.state.run_repository, SqlRunRepository)
     with TestClient(app):

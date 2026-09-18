@@ -4,6 +4,7 @@ from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 import subprocess
 import sys
+from time import monotonic
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
@@ -78,6 +79,22 @@ def test_agent_emits_monotonic_events_from_fake_adapter(tmp_path: Path) -> None:
         "started", "log", "assertion", "error", "finished"
     ]
     assert all(event.run_id == envelope.run_id for event in events)
+
+
+def test_agent_emits_streaming_output_without_duplicate_log(tmp_path: Path) -> None:
+    class StreamingAdapter:
+        def run_streaming(self, envelope, workspace, output_sink):
+            output_sink("stdout", "live output")
+            return AdapterResult(ResultOutcome.SUCCEEDED, "done", stdout="live output")
+
+    events = []
+    envelope = task()
+    RunnerAgent(
+        envelope, tmp_path, events.append, {Engine.PYTEST: StreamingAdapter()}
+    ).run()
+
+    logs = [event for event in events if event.type is EventType.LOG]
+    assert [event.payload["message"] for event in logs] == ["live output"]
 
 
 def test_event_sink_failure_does_not_advance_sequence(tmp_path: Path) -> None:
@@ -352,6 +369,52 @@ def test_subprocess_timeout_and_playwright_environment(tmp_path: Path) -> None:
     assert environment["RUNNER_ENGINE"] == "playwright"
     assert environment["PYTHONIOENCODING"] == "utf-8"
     assert environment["PYTHONUTF8"] == "1"
+    assert environment["PYTHONUNBUFFERED"] == "1"
+
+
+def test_subprocess_streams_output_before_process_finishes(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "live_output.py"
+    entrypoint.write_text(
+        "import time\nprint('first')\ntime.sleep(0.3)\nprint('second')\n",
+        encoding="utf-8",
+    )
+    observed = []
+
+    started = monotonic()
+    result = PlaywrightAdapter().run_streaming(
+        task(Engine.PLAYWRIGHT, entrypoint=entrypoint.name), tmp_path,
+        lambda stream, message: observed.append((stream, message, monotonic())),
+    )
+    finished = monotonic()
+
+    assert result.outcome is ResultOutcome.SUCCEEDED
+    assert [(stream, message) for stream, message, _ in observed] == [
+        ("stdout", "first"), ("stdout", "second")
+    ]
+    assert finished - observed[0][2] >= 0.2
+
+
+def test_streaming_subprocess_timeout_returns_partial_output(tmp_path: Path) -> None:
+    entrypoint = tmp_path / "timeout_output.py"
+    entrypoint.write_text(
+        "import time\nprint('before timeout')\ntime.sleep(5)\n",
+        encoding="utf-8",
+    )
+    observed = []
+
+    result = PlaywrightAdapter().run_streaming(
+        task(
+            Engine.PLAYWRIGHT, entrypoint=entrypoint.name,
+            parameters={"timeout": 0.5},
+        ),
+        tmp_path,
+        lambda stream, message: observed.append((stream, message)),
+    )
+
+    assert result.outcome is ResultOutcome.TIMED_OUT
+    assert result.timed_out is True
+    assert ("stdout", "before timeout") in observed
+    assert "before timeout" in result.stdout
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process-tree behavior")

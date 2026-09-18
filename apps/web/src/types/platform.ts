@@ -7,6 +7,8 @@ export type NavKey =
   | 'executions'
   | 'defects'
   | 'reports'
+  | 'load-testing'
+  | 'environments'
   | 'data-factory'
   | 'version-control'
 
@@ -80,6 +82,8 @@ export const navigationItems: NavigationItem[] = [
   { key: 'executions', label: '执行中心', icon: 'executions' },
   { key: 'defects', label: '缺陷管理', icon: 'defects' },
   { key: 'reports', label: '测试报告', icon: 'reports' },
+  { key: 'load-testing', label: '压测中心', icon: 'reports' },
+  { key: 'environments', label: '环境配置', icon: 'data-factory' },
   { key: 'data-factory', label: '数据工厂', icon: 'data-factory' },
   { key: 'version-control', label: '代码版本', icon: 'version-control' },
 ]

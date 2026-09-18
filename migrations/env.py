@@ -20,6 +20,7 @@ from services.api.data_factory_models import (
     DataFactoryRunModel,
     DataFactoryWorkflowModel,
 )
+from services.api.load_test_models import LoadTestModel, LoadTestRunModel
 from services.api.parameter_models import (
     AutomationScriptParameterModel,
     ParameterEnumSetModel,
@@ -56,6 +57,7 @@ _registered_models = (
     SecretCapabilityGrantModel,
     TestPlanModel, TestPlanRevisionModel, ExecutionBatchModel, RunSpecModel,
     DataFactoryWorkflowModel, DataFactoryRunModel,
+    LoadTestModel, LoadTestRunModel,
 )
 
 

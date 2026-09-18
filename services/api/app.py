@@ -69,6 +69,15 @@ from .environment_repository import (
 )
 from .environment_routes import environment_router
 from .environment_sql_repository import SqlEnvironmentRepository
+from .load_test_executor import LoadTestExecutor
+from .load_test_repository import (
+    LoadTestActiveRunConflict, LoadTestConflict, LoadTestNameConflict,
+    LoadTestNotFound, LoadTestRepository, LoadTestRunNotFound,
+    LoadTestVersionConflict,
+)
+from .load_test_routes import load_test_router, load_test_run_router
+from .load_test_service import LoadTestService
+from .load_test_sql_repository import SqlLoadTestRepository
 from .parameter_repository import (
     ParameterEnumConflict,
     ParameterEnumNotFound,
@@ -180,6 +189,7 @@ def create_app(
     automation_repository: AutomationRepository | SqlAutomationRepository | None = None,
     case_generator: AiCaseGenerator | None = None,
     environment_repository: EnvironmentRepository | SqlEnvironmentRepository | None = None,
+    configuration_resolver: ConfigurationResolver | None = None,
     test_plan_repository: TestPlanRepository | SqlTestPlanRepository | None = None,
     auth_repository: AuthRepositoryLike | None = None,
     project_repository: ProjectRepository | SqlProjectRepository | None = None,
@@ -191,6 +201,9 @@ def create_app(
     service_control_service: ServiceControlService | None = None,
     data_factory_repository: DataFactoryRepository | SqlDataFactoryRepository | None = None,
     data_factory_executor: DataFactoryExecutor | None = None,
+    load_test_repository: LoadTestRepository | SqlLoadTestRepository | None = None,
+    load_test_executor: LoadTestExecutor | None = None,
+    load_test_service: LoadTestService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     database_engine = None
@@ -200,6 +213,7 @@ def create_app(
         or environment_repository is None or test_plan_repository is None
         or auth_repository is None or project_repository is None
         or parameter_repository is None or data_factory_repository is None
+        or load_test_repository is None
     ):
         database_engine = create_database_engine(resolved_settings.database_url)
         sessions = create_session_factory(database_engine)
@@ -228,6 +242,9 @@ def create_app(
             SqlEnvironmentRepository(sessions, encryptor)
             if sessions else EnvironmentRepository(encryptor)
         )
+    configuration_resolver = configuration_resolver or ConfigurationResolver(
+        environment_repository, encryptor
+    )
     if test_plan_repository is None:
         test_plan_repository = (
             SqlTestPlanRepository(sessions)
@@ -248,6 +265,16 @@ def create_app(
             SqlDataFactoryRepository(sessions) if sessions else DataFactoryRepository()
         )
     data_factory_executor = data_factory_executor or DataFactoryExecutor()
+    if load_test_repository is None:
+        load_test_repository = (
+            SqlLoadTestRepository(sessions) if sessions else LoadTestRepository()
+        )
+    load_test_executor = load_test_executor or LoadTestExecutor()
+    load_test_service = load_test_service or LoadTestService(
+        load_test_repository, load_test_executor,
+        environment_repository=environment_repository,
+        configuration_resolver=configuration_resolver,
+    )
     if resolved_settings.auto_dispatch and dispatcher is None:
         if resolved_settings.local_runner_enabled:
             dispatcher = DatabaseRunDispatcher(repository)
@@ -293,6 +320,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        load_test_service.recover_interrupted_runs()
         if local_runner_service is not None:
             local_runner_service.start()
         try:
@@ -300,6 +328,7 @@ def create_app(
         finally:
             if local_runner_service is not None:
                 local_runner_service.stop()
+            load_test_service.shutdown()
             if database_engine is not None:
                 database_engine.dispose()
 
@@ -317,9 +346,7 @@ def create_app(
     application.state.automation_repository = automation_repository
     application.state.parameter_repository = parameter_repository
     application.state.environment_repository = environment_repository
-    application.state.configuration_resolver = ConfigurationResolver(
-        environment_repository, encryptor
-    )
+    application.state.configuration_resolver = configuration_resolver
     application.state.test_plan_repository = test_plan_repository
     application.state.run_spec_materializer = RunSpecTaskMaterializer(
         test_plan_repository
@@ -330,6 +357,9 @@ def create_app(
     application.state.project_repository = project_repository
     application.state.data_factory_repository = data_factory_repository
     application.state.data_factory_executor = data_factory_executor
+    application.state.load_test_repository = load_test_repository
+    application.state.load_test_executor = load_test_executor
+    application.state.load_test_service = load_test_service
     application.state.version_control_service = version_control_service
     application.state.service_control_service = service_control_service
 
@@ -360,6 +390,8 @@ def create_app(
     application.include_router(auth_router)
     application.include_router(project_router)
     application.include_router(data_factory_router)
+    application.include_router(load_test_router)
+    application.include_router(load_test_run_router)
     application.include_router(runs_router)
     application.include_router(requirements_router)
     application.include_router(test_cases_router)
@@ -451,6 +483,42 @@ def create_app(
         request: Request, exc: WorkflowValidationError | WorkflowExecutionError
     ) -> JSONResponse:
         return _problem(request, 422, "workflow_invalid", str(exc))
+
+    @application.exception_handler(LoadTestNotFound)
+    async def load_test_not_found_handler(
+        request: Request, exc: LoadTestNotFound
+    ) -> JSONResponse:
+        return _problem(request, 404, "load_test_not_found", str(exc))
+
+    @application.exception_handler(LoadTestRunNotFound)
+    async def load_test_run_not_found_handler(
+        request: Request, exc: LoadTestRunNotFound
+    ) -> JSONResponse:
+        return _problem(request, 404, "load_test_run_not_found", str(exc))
+
+    @application.exception_handler(LoadTestNameConflict)
+    async def load_test_name_conflict_handler(
+        request: Request, exc: LoadTestNameConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "load_test_name_conflict", str(exc))
+
+    @application.exception_handler(LoadTestVersionConflict)
+    async def load_test_version_conflict_handler(
+        request: Request, exc: LoadTestVersionConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "load_test_version_conflict", str(exc))
+
+    @application.exception_handler(LoadTestActiveRunConflict)
+    async def load_test_active_run_handler(
+        request: Request, exc: LoadTestActiveRunConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "load_test_active_run", str(exc))
+
+    @application.exception_handler(LoadTestConflict)
+    async def load_test_conflict_handler(
+        request: Request, exc: LoadTestConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "load_test_conflict", str(exc))
 
     @application.exception_handler(ProjectNameConflict)
     async def project_name_conflict_handler(

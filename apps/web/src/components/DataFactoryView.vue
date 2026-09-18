@@ -24,13 +24,17 @@ const operators = [
 const CANVAS_WIDTH = 1000
 const CANVAS_HEIGHT = 620
 const NODE_WIDTH = 168
+const NODE_HEIGHT = 70
+const NODE_VERTICAL_STEP = 130
+type InitialParameterType = 'text' | 'number' | 'boolean' | 'json'
+type InitialParameter = { id: string; key: string; type: InitialParameterType; value: string }
 
 const workflows = ref<DataFactoryWorkflow[]>([])
 const draft = ref<DataFactoryWorkflow | null>(null)
 const selectedNodeId = ref('')
 const selectedEdgeId = ref('')
 const connectingSource = ref('')
-const variablesText = ref('{}')
+const initialParameters = ref<InitialParameter[]>([])
 const jsonEditors = ref<Record<string, string>>({})
 const runs = ref<WorkflowRun[]>([])
 const selectedRun = ref<WorkflowRun | null>(null)
@@ -57,7 +61,7 @@ const selectedNode = computed(() => draft.value?.nodes.find((node) => node.id ==
 const selectedEdge = computed(() => draft.value?.edges.find((edge) => edge.id === selectedEdgeId.value) ?? null)
 
 function cloneWorkflow(workflow: DataFactoryWorkflow): DataFactoryWorkflow {
-  return structuredClone(workflow)
+  return JSON.parse(JSON.stringify(workflow)) as DataFactoryWorkflow
 }
 
 function setFeedback(message = '') {
@@ -109,6 +113,24 @@ function isJsonValue(value: unknown): value is JsonValue {
   return typeof value === 'object' && Object.values(value as Record<string, unknown>).every(isJsonValue)
 }
 
+function parametersFromVariables(variables: JsonObject): InitialParameter[] {
+  return Object.entries(variables).map(([key, value]) => {
+    let type: InitialParameterType = 'json'
+    let parameterValue = JSON.stringify(value, null, 2)
+    if (typeof value === 'string') {
+      type = 'text'
+      parameterValue = value
+    } else if (typeof value === 'number') {
+      type = 'number'
+      parameterValue = String(value)
+    } else if (typeof value === 'boolean') {
+      type = 'boolean'
+      parameterValue = String(value)
+    }
+    return { id: crypto.randomUUID(), key, type, value: parameterValue }
+  })
+}
+
 function parseObject(text: string, label: string): JsonObject {
   const value = parseJson(text, label)
   if (value === null || Array.isArray(value) || typeof value !== 'object') {
@@ -143,15 +165,32 @@ function commitNodeEditors(): boolean {
 
 function useWorkflow(workflow: DataFactoryWorkflow) {
   draft.value = cloneWorkflow(workflow)
+  orientNodesVertically(draft.value.nodes)
   selectedNodeId.value = ''
   selectedEdgeId.value = ''
   connectingSource.value = ''
-  variablesText.value = JSON.stringify(workflow.variables, null, 2)
+  initialParameters.value = parametersFromVariables(workflow.variables)
   runs.value = []
   selectedRun.value = null
   dirty.value = false
   setFeedback()
   void loadRuns(workflow.id)
+}
+
+function orientNodesVertically(nodes: WorkflowNode[]) {
+  if (nodes.length < 2) return
+  const xs = nodes.map((node) => node.x)
+  const ys = nodes.map((node) => node.y)
+  const minX = Math.min(...xs)
+  const minY = Math.min(...ys)
+  const horizontalRange = Math.max(...xs) - minX
+  const verticalRange = Math.max(...ys) - minY
+  if (horizontalRange <= verticalRange) return
+  nodes.forEach((node) => {
+    const previousX = node.x
+    node.x = 48 + node.y - minY
+    node.y = 54 + previousX - minX
+  })
 }
 
 async function loadWorkflows() {
@@ -249,7 +288,38 @@ async function removeWorkflow() {
 }
 
 function parsedVariables(): JsonObject {
-  return parseObject(variablesText.value, '初始变量')
+  const variables: JsonObject = {}
+  initialParameters.value.forEach((parameter, index) => {
+    const key = parameter.key.trim()
+    if (!key) throw new Error(`第 ${index + 1} 个初始参数缺少参数名。`)
+    if (Object.hasOwn(variables, key)) throw new Error(`初始参数“${key}”重复。`)
+    if (parameter.type === 'text') variables[key] = parameter.value
+    else if (parameter.type === 'boolean') variables[key] = parameter.value === 'true'
+    else if (parameter.type === 'number') {
+      const value = Number(parameter.value)
+      if (!parameter.value.trim() || !Number.isFinite(value)) throw new Error(`初始参数“${key}”必须是有效数字。`)
+      variables[key] = value
+    } else variables[key] = parseJson(parameter.value, `初始参数“${key}”`)
+  })
+  return variables
+}
+
+function addInitialParameter() {
+  initialParameters.value.push({ id: crypto.randomUUID(), key: '', type: 'text', value: '' })
+  markDirty()
+}
+
+function removeInitialParameter(id: string) {
+  initialParameters.value = initialParameters.value.filter((parameter) => parameter.id !== id)
+  markDirty()
+}
+
+function changeInitialParameterType(parameter: InitialParameter) {
+  if (parameter.type === 'boolean') parameter.value = 'false'
+  else if (parameter.type === 'number') parameter.value = '0'
+  else if (parameter.type === 'json') parameter.value = 'null'
+  else parameter.value = ''
+  markDirty()
 }
 
 async function persistWorkflow(showMessage = true): Promise<boolean> {
@@ -274,7 +344,7 @@ async function persistWorkflow(showMessage = true): Promise<boolean> {
       edges: draft.value.edges, variables, state_version: draft.value.state_version })
     workflows.value = workflows.value.map((item) => item.id === saved.id ? saved : item)
     draft.value = cloneWorkflow(saved)
-    variablesText.value = JSON.stringify(saved.variables, null, 2)
+    initialParameters.value = parametersFromVariables(saved.variables)
     dirty.value = false
     if (showMessage) success.value = '工作流已保存。'
     return true
@@ -300,7 +370,7 @@ function addNode(type: WorkflowNodeType) {
   if (!commitNodeEditors()) return
   const index = draft.value.nodes.length
   const node: WorkflowNode = { id: crypto.randomUUID(), name: `${nodeLabels[type]} ${index + 1}`, type,
-    x: 48 + (index % 4) * 210, y: 54 + Math.floor(index / 4) * 130, config: defaultConfig(type) }
+    x: 48, y: 54 + index * NODE_VERTICAL_STEP, config: defaultConfig(type) }
   draft.value.nodes.push(node)
   selectedNodeId.value = node.id
   selectedEdgeId.value = ''
@@ -402,13 +472,18 @@ function edgePath(edge: WorkflowEdge): string {
   const sourceNode = draft.value?.nodes.find((node) => node.id === edge.source)
   const targetNode = draft.value?.nodes.find((node) => node.id === edge.target)
   if (!sourceNode || !targetNode) return ''
-  const x1 = sourceNode.x + NODE_WIDTH
-  const y1 = sourceNode.y + 35
-  const x2 = targetNode.x
-  const y2 = targetNode.y + 35
-  const curve = Math.max(55, Math.abs(x2 - x1) * .45)
-  return `M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`
+  const x1 = sourceNode.x + NODE_WIDTH / 2
+  const y1 = sourceNode.y + NODE_HEIGHT
+  const x2 = targetNode.x + NODE_WIDTH / 2
+  const y2 = targetNode.y
+  const curve = Math.max(45, Math.abs(y2 - y1) * .45)
+  return `M ${x1} ${y1} C ${x1} ${y1 + curve}, ${x2} ${y2 - curve}, ${x2} ${y2}`
 }
+
+const canvasHeight = computed(() => Math.max(
+  CANVAS_HEIGHT,
+  ...(draft.value?.nodes.map((node) => node.y + NODE_HEIGHT + 54) ?? []),
+))
 
 function startDrag(event: PointerEvent, node: WorkflowNode) {
   if (event.button !== 0 || connectingSource.value) return
@@ -427,7 +502,7 @@ function moveDrag(event: PointerEvent) {
   if (!node) return
   const rect = surface.value.getBoundingClientRect()
   node.x = Math.round(Math.max(8, Math.min(CANVAS_WIDTH - NODE_WIDTH - 8, event.clientX - rect.left - drag.offsetX)))
-  node.y = Math.round(Math.max(8, Math.min(CANVAS_HEIGHT - 78, event.clientY - rect.top - drag.offsetY)))
+  node.y = Math.round(Math.max(8, Math.min(100000, event.clientY - rect.top - drag.offsetY)))
   markDirty()
 }
 
@@ -541,18 +616,18 @@ onBeforeUnmount(() => {
             </aside>
 
             <div class="canvas-scroll">
-              <div ref="surface" class="canvas-surface" :style="{ width: `${CANVAS_WIDTH}px`, height: `${CANVAS_HEIGHT}px` }" @pointerdown.self="clearSelection">
-                <svg class="edge-layer" :viewBox="`0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}`">
+              <div ref="surface" class="canvas-surface" :style="{ width: `${CANVAS_WIDTH}px`, height: `${canvasHeight}px` }" @pointerdown.self="clearSelection">
+                <svg class="edge-layer" :viewBox="`0 0 ${CANVAS_WIDTH} ${canvasHeight}`">
                   <defs><marker id="factory-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" /></marker></defs>
                   <g v-for="edge in draft.edges" :key="edge.id" @click.stop="chooseEdge(edge)">
                     <path class="edge-hit" :d="edgePath(edge)" />
                     <path class="edge-line" :class="{ selected: selectedEdgeId === edge.id }" :d="edgePath(edge)" marker-end="url(#factory-arrow)" />
-                    <text :x="(draft.nodes.find(n => n.id === edge.source)?.x ?? 0) + NODE_WIDTH + 8" :y="(draft.nodes.find(n => n.id === edge.source)?.y ?? 0) + 27">{{ outcomeLabels[edge.outcome] }}</text>
+                    <text :x="(draft.nodes.find(n => n.id === edge.source)?.x ?? 0) + NODE_WIDTH / 2 + 10" :y="(draft.nodes.find(n => n.id === edge.source)?.y ?? 0) + NODE_HEIGHT + 15">{{ outcomeLabels[edge.outcome] }}</text>
                   </g>
                 </svg>
                 <div v-for="node in draft.nodes" :key="node.id" class="canvas-node" :class="[`node-${node.type}`, { selected: selectedNodeId === node.id, connecting: connectingSource === node.id }]" :style="{ left: `${node.x}px`, top: `${node.y}px`, width: `${NODE_WIDTH}px` }" role="button" tabindex="0" @pointerdown.stop="startDrag($event, node)" @click.stop="chooseNode(node)" @keydown.enter="chooseNode(node)">
                   <span class="node-icon">{{ node.type === 'http' ? 'H' : node.type === 'condition' ? '?' : 'Ⅱ' }}</span>
-                  <span><strong>{{ node.name }}</strong><small>{{ nodeLabels[node.type] }}</small></span><i class="port"></i>
+                  <span><strong>{{ node.name }}</strong><small>{{ nodeLabels[node.type] }}</small></span><i class="port" style="right:auto;bottom:-7px;left:50%;transform:translateX(-50%)"></i>
                 </div>
                 <div v-if="draft.nodes.length === 0" class="canvas-empty"><strong>画布还是空的</strong><span>从左侧添加第一个节点</span></div>
               </div>
@@ -589,7 +664,21 @@ onBeforeUnmount(() => {
                 <button class="text-danger" type="button" @click="removeEdge">删除连线</button>
               </template>
               <div v-else class="inspector-empty"><strong>配置面板</strong><p>选择画布中的节点或连线进行配置。</p></div>
-              <div class="variables-editor"><div class="panel-title"><strong>初始变量</strong><span>JSON</span></div><textarea v-model="variablesText" rows="8" aria-label="初始变量 JSON" @input="markDirty"></textarea><small>执行与调试时作为默认变量传入，可使用 JSON 对象覆盖。</small></div>
+              <div class="variables-editor">
+                <div class="panel-title"><strong>初始参数</strong><button class="parameter-add" type="button" @click="addInitialParameter">+ 添加</button></div>
+                <p v-if="initialParameters.length === 0" class="parameter-empty">暂无初始参数</p>
+                <div v-for="parameter in initialParameters" :key="parameter.id" class="parameter-card">
+                  <label><span>参数名</span><input v-model="parameter.key" maxlength="255" placeholder="例如：userId" spellcheck="false" @input="markDirty"></label>
+                  <label><span>类型</span><select v-model="parameter.type" @change="changeInitialParameterType(parameter)"><option value="text">文本</option><option value="number">数字</option><option value="boolean">布尔</option><option value="json">JSON</option></select></label>
+                  <label><span>默认值</span>
+                    <select v-if="parameter.type === 'boolean'" v-model="parameter.value" @change="markDirty"><option value="true">true</option><option value="false">false</option></select>
+                    <textarea v-else-if="parameter.type === 'json'" v-model="parameter.value" rows="3" spellcheck="false" @input="markDirty"></textarea>
+                    <input v-else v-model="parameter.value" :type="parameter.type === 'number' ? 'number' : 'text'" spellcheck="false" @input="markDirty">
+                  </label>
+                  <button class="parameter-remove" type="button" @click="removeInitialParameter(parameter.id)">删除参数</button>
+                </div>
+                <small>参数会作为工作流默认变量，可在 URL、请求参数和请求体中通过 <code v-text="'{{参数名}}'"></code> 引用。</small>
+              </div>
             </aside>
           </div>
 
@@ -615,4 +704,42 @@ onBeforeUnmount(() => {
 .factory{display:flex;flex-direction:column;gap:16px}.factory-header{display:flex;align-items:center;justify-content:space-between;gap:16px}.factory-header h2{margin:0;color:#1c273a;font-size:20px}.factory-header p{margin:6px 0 0;color:#8994a7;font-size:12px}.primary,.secondary{border-radius:8px;font-weight:700;cursor:pointer}.primary{height:40px;padding:0 17px;border:0;color:#fff;background:linear-gradient(100deg,#456fd6,#6b60dc)}.secondary{height:34px;padding:0 12px;border:1px solid #dfe5ee;color:#556176;background:#fff}.primary:disabled,.secondary:disabled{cursor:not-allowed;opacity:.55}.secondary.danger,.text-danger{color:#bd4654}.state{min-height:260px;padding:28px;border:1px solid #e5eaf2;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;background:#fff}.state p{max-width:440px;margin:0;color:#8994a7;font-size:12px}.state button{margin-top:8px}.error-state{border-color:#ffd7db}.loader{width:20px;height:20px;border:3px solid #dbe4f5;border-top-color:#4f72ca;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.notice{margin:0;padding:10px 12px;border-radius:8px;font-size:12px}.notice-error{border:1px solid #ffd7db;color:#b84350;background:#fff5f6}.notice-success{border:1px solid #ccebd8;color:#287a49;background:#f2fbf5}.factory-workspace{min-height:640px;display:grid;grid-template-columns:210px minmax(0,1fr);border:1px solid #e3e8f0;border-radius:14px;overflow:hidden;background:#fff}.workflow-list{padding:14px;border-right:1px solid #e8edf4;background:#f8fafc}.panel-title{min-height:26px;display:flex;align-items:center;justify-content:space-between;gap:8px;color:#344158;font-size:12px}.panel-title span{color:#8994a7;font-size:10px}.workflow-item{width:100%;display:grid;gap:4px;margin-top:7px;padding:11px;border:1px solid transparent;border-radius:9px;text-align:left;background:transparent;cursor:pointer}.workflow-item:hover{background:#fff}.workflow-item.active{border-color:#cfdbf8;background:#fff;box-shadow:0 3px 10px rgba(54,79,136,.08)}.workflow-item strong{overflow:hidden;color:#344158;font-size:12px;text-overflow:ellipsis;white-space:nowrap}.workflow-item small{color:#929daf;font-size:9px}.empty-small{margin-top:18px;color:#9aa4b4;text-align:center;font-size:10px;line-height:1.7}.editor{min-width:0}.editor-toolbar{min-height:66px;padding:10px 14px;border-bottom:1px solid #e8edf4;display:flex;align-items:center;justify-content:space-between;gap:12px}.workflow-fields{min-width:160px;display:grid;gap:4px}.workflow-fields input{padding:2px 5px;border:1px solid transparent;border-radius:5px;background:transparent}.workflow-fields input:first-child{color:#243149;font-size:14px;font-weight:750}.workflow-fields input:last-child{color:#8792a5;font-size:10px}.workflow-fields input:focus{border-color:#b8c9ef;background:#fff;outline:0}.toolbar-actions{display:flex;align-items:center;gap:7px}.dirty-mark{color:#b47a24;font-size:10px;white-space:nowrap}.editor-grid{display:grid;grid-template-columns:132px minmax(420px,1fr) 270px;min-height:620px}.node-palette{padding:12px;border-right:1px solid #e8edf4;background:#fbfcfe}.node-palette>button{width:100%;display:flex;align-items:center;gap:8px;margin:8px 0;padding:9px 7px;border:1px solid #e2e7ef;border-radius:9px;text-align:left;background:#fff;cursor:pointer}.node-palette i{width:25px;height:25px;display:grid;place-items:center;border-radius:7px;color:#fff;font-size:11px;font-style:normal;font-weight:800}.node-palette button span{min-width:0;display:grid;gap:2px}.node-palette button strong{color:#344158;font-size:10px}.node-palette button small{color:#98a2b3;font-size:8px}.type-http{background:#4e78da}.type-condition{background:#d39436}.type-parallel{background:#795ed0}.palette-tip{margin:16px 2px;color:#919bad;font-size:9px;line-height:1.6}.canvas-scroll{position:relative;overflow:auto;background:#f5f7fb}.canvas-surface{position:relative;background-color:#f7f9fc;background-image:radial-gradient(#cbd4e3 .7px,transparent .7px);background-size:18px 18px;user-select:none}.edge-layer{position:absolute;inset:0;width:100%;height:100%;overflow:visible}.edge-line{fill:none;stroke:#99a8c0;stroke-width:2;pointer-events:none}.edge-line.selected{stroke:#4f73d2;stroke-width:3}.edge-hit{fill:none;stroke:transparent;stroke-width:14;cursor:pointer}.edge-layer marker path{fill:#99a8c0}.edge-layer text{fill:#77859a;font-size:9px;pointer-events:none}.canvas-node{position:absolute;height:70px;padding:10px 16px 10px 10px;border:2px solid #dce3ed;border-left-width:4px;border-radius:10px;display:flex;align-items:center;gap:9px;background:#fff;box-shadow:0 5px 15px rgba(33,48,80,.08);cursor:grab;touch-action:none}.canvas-node.selected{border-color:#6c8dde;box-shadow:0 0 0 3px #e2eaff}.canvas-node.connecting{border-color:#6b60dc;animation:pulse 1.2s infinite}@keyframes pulse{50%{box-shadow:0 0 0 6px rgba(107,96,220,.13)}}.canvas-node:active{cursor:grabbing}.node-http{border-left-color:#4e78da}.node-condition{border-left-color:#d39436}.node-parallel{border-left-color:#795ed0}.node-icon{width:27px;height:27px;flex:0 0 auto;display:grid;place-items:center;border-radius:7px;color:#fff;background:#5b7bd0;font-size:11px;font-weight:800}.node-condition .node-icon{background:#d39436}.node-parallel .node-icon{background:#795ed0}.canvas-node>span:nth-child(2){min-width:0;display:grid;gap:3px}.canvas-node strong{overflow:hidden;color:#2e3a50;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.canvas-node small{color:#909bad;font-size:9px}.port{position:absolute;right:-7px;width:12px;height:12px;border:2px solid #fff;border-radius:50%;background:#8b9ab2}.canvas-empty{position:absolute;left:50%;top:44%;display:grid;gap:5px;text-align:center;transform:translate(-50%,-50%);color:#9aa5b7}.canvas-empty strong{font-size:13px}.canvas-empty span{font-size:10px}.inspector{min-width:0;padding:12px;border-left:1px solid #e8edf4;overflow-y:auto;background:#fff}.inspector label,.modal label{display:grid;gap:5px;margin:9px 0;color:#5f6c81;font-size:10px}.inspector input,.inspector select,.inspector textarea,.modal input,.modal textarea{width:100%;border:1px solid #dfe5ee;border-radius:7px;color:#29364a;background:#fbfcfe;font:500 11px inherit}.inspector input,.inspector select,.modal input{height:34px;padding:0 9px}.inspector textarea,.modal textarea{padding:8px;resize:vertical;font-family:Consolas,"Microsoft YaHei",monospace;line-height:1.45}.inspector input:focus,.inspector select:focus,.inspector textarea:focus{border-color:#6b8de2;outline:0}.inspector-actions{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.text-danger{padding:0;border:0;background:transparent;font-size:10px;font-weight:700;cursor:pointer}.edge-summary{padding:9px;border-radius:7px;color:#5e6b80;background:#f5f7fb;font-size:10px;line-height:1.5}.inspector-empty{padding:22px 8px;text-align:center;color:#8f9aac}.inspector-empty strong{font-size:12px}.inspector-empty p{font-size:10px;line-height:1.6}.variables-editor{margin-top:14px;padding-top:12px;border-top:1px solid #e8edf4}.variables-editor textarea{width:100%;border:1px solid #dfe5ee;border-radius:7px;padding:8px;resize:vertical;color:#29364a;background:#fbfcfe;font:10px/1.5 Consolas,monospace}.variables-editor small{display:block;margin-top:5px;color:#929daf;font-size:9px;line-height:1.5}.runs-panel{border-top:1px solid #e8edf4}.runs-panel>header{padding:11px 14px;display:flex;align-items:center;justify-content:space-between}.runs-panel h3{display:inline;margin:0;color:#344158;font-size:13px}.runs-panel header span{margin-left:8px;color:#8f9aac;font-size:9px}.runs-panel header button{border:0;color:#5071c7;background:transparent;font-size:10px;font-weight:700;cursor:pointer}.runs-content{min-height:190px;display:grid;grid-template-columns:220px minmax(0,1fr);border-top:1px solid #eef1f6}.run-list{padding:9px;border-right:1px solid #eef1f6;background:#fafbfd}.run-list button{width:100%;padding:8px;border:1px solid transparent;border-radius:7px;display:flex;align-items:center;justify-content:space-between;background:transparent;cursor:pointer}.run-list button.active{border-color:#d8e2f8;background:#fff}.run-list small,.run-list p{color:#909bad;font-size:9px}.run-status{max-width:100px;overflow:hidden;color:#4d70ca;font-size:9px;font-weight:800;text-overflow:ellipsis}.run-status.succeeded,.run-status.success{color:#278555}.run-status.failed,.run-status.failure{color:#bf4654}.run-result{min-width:0;padding:12px}.run-result>div{display:flex;justify-content:space-between;gap:10px;color:#344158;font-size:10px}.run-result>div span{color:#929daf;font-size:9px}.run-result pre{max-height:220px;overflow:auto;margin:10px 0 0;padding:10px;border-radius:7px;color:#4a5870;background:#f5f7fb;font:10px/1.5 Consolas,monospace;white-space:pre-wrap}.run-result-empty{display:grid;place-items:center;color:#9aa5b6;font-size:10px}.modal{position:fixed;inset:0;z-index:60;padding:20px;display:grid;place-items:center;background:rgba(20,28,45,.42)}.modal-card{width:min(500px,100%);border-radius:14px;background:#fff;box-shadow:0 24px 60px rgba(20,28,45,.28);overflow:hidden}.modal-card header,.modal-card footer{padding:16px 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #eef1f6}.modal-card h3{margin:0;color:#26334b;font-size:15px}.modal-card header button{width:28px;height:28px;border:0;border-radius:7px;color:#66748a;background:#f0f3f7;cursor:pointer}.modal-body{padding:14px 20px}.modal-card footer{justify-content:flex-end;gap:8px;border-top:1px solid #eef1f6;border-bottom:0}.modal textarea{font-family:inherit}
 @media(max-width:1120px){.factory-workspace{grid-template-columns:180px minmax(0,1fr)}.editor-grid{grid-template-columns:115px minmax(420px,1fr)}.inspector{grid-column:1/-1;border-top:1px solid #e8edf4;border-left:0;max-height:none}.inspector label{max-width:620px}.variables-editor{max-width:620px}}
 @media(max-width:760px){.factory-header,.editor-toolbar{align-items:flex-start;flex-direction:column}.factory-workspace{display:block}.workflow-list{max-height:210px;overflow-y:auto;border-right:0;border-bottom:1px solid #e8edf4}.toolbar-actions{width:100%;overflow-x:auto}.editor-grid{display:block}.node-palette{display:flex;align-items:center;gap:6px;overflow-x:auto;border-right:0;border-bottom:1px solid #e8edf4}.node-palette .panel-title,.palette-tip{display:none}.node-palette>button{min-width:130px}.canvas-scroll{height:500px}.inspector{border-left:0}.runs-content{grid-template-columns:1fr}.run-list{max-height:150px;overflow:auto;border-right:0;border-bottom:1px solid #eef1f6}.run-result>div{flex-direction:column}}
+</style>
+
+<style scoped>
+.parameter-add {
+  padding: 2px 0;
+  border: 0;
+  color: #4f72ca;
+  background: transparent;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.parameter-empty {
+  margin: 8px 0;
+  padding: 12px;
+  border: 1px dashed #dce3ed;
+  border-radius: 7px;
+  color: #98a2b3;
+  text-align: center;
+  font-size: 9px;
+}
+.parameter-card {
+  margin: 8px 0;
+  padding: 9px;
+  border: 1px solid #e2e7ef;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+.parameter-card label { margin: 6px 0; }
+.parameter-remove {
+  padding: 0;
+  border: 0;
+  color: #bd4654;
+  background: transparent;
+  font-size: 9px;
+  font-weight: 700;
+  cursor: pointer;
+}
 </style>

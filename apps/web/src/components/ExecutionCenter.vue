@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import {
   checkReady,
@@ -21,12 +21,15 @@ const serviceDetail = ref('正在检查 /health/ready 与 /api/v1/runs')
 const runsError = ref('')
 const search = ref('')
 const statusFilter = ref('all')
+const currentPage = ref(1)
+const pageSize = ref(10)
 const selectedRun = ref<RunResponse | null>(null)
 const runEvents = ref<RunEvent[]>([])
 const eventTotal = ref(0)
 const connectionState = ref<ConnectionState>('idle')
 const detailError = ref('')
 const detailPanel = ref<HTMLElement | null>(null)
+const logsExpanded = ref(false)
 let activeController: AbortController | null = null
 let eventsController: AbortController | null = null
 let eventSource: EventSource | null = null
@@ -61,7 +64,17 @@ const filteredRuns = computed(() => {
     if (!keyword) return true
     return [run.id, run.engine, run.state]
       .some((value) => value.toLocaleLowerCase().includes(keyword))
-  })
+  }).sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+})
+const totalPages = computed(() => Math.max(1, Math.ceil(filteredRuns.value.length / pageSize.value)))
+const paginatedRuns = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return filteredRuns.value.slice(start, start + pageSize.value)
+})
+
+watch([search, statusFilter, pageSize], () => { currentPage.value = 1 })
+watch(totalPages, (pages) => {
+  if (currentPage.value > pages) currentPage.value = pages
 })
 
 const progress = computed<number | null>(() => {
@@ -251,6 +264,7 @@ function closeDetails() {
   runEvents.value = []
   eventTotal.value = 0
   detailError.value = ''
+  logsExpanded.value = false
   connectionState.value = 'idle'
 }
 
@@ -339,19 +353,28 @@ onBeforeUnmount(() => {
       <div v-else-if="filteredRuns.length === 0" class="state-view compact">
         <span class="empty-icon" aria-hidden="true">⌕</span><strong>没有匹配的运行</strong><p>请调整搜索关键词或状态筛选条件。</p>
       </div>
-      <div v-else class="table-wrap" role="region" aria-label="测试运行列表，可横向滚动" tabindex="0">
-        <table>
-          <caption class="sr-only">测试运行列表</caption>
-          <thead><tr><th scope="col">运行</th><th scope="col">状态</th><th scope="col">进度</th><th scope="col">触发方式</th><th scope="col">环境</th><th scope="col">创建时间</th><th scope="col">耗时</th></tr></thead>
-          <tbody>
-            <tr v-for="run in filteredRuns" :key="run.id" :class="{ selected: selectedRun?.id === run.id }" @click="selectRun(run)">
-              <td><button class="run-link" type="button" aria-controls="run-live-detail" :aria-expanded="selectedRun?.id === run.id" @click.stop="selectRun(run)"><strong>{{ run.engine }} 测试运行</strong><small>{{ run.id }}</small></button></td>
-              <td><span class="status-pill" :class="getStatus(run.state).tone"><i></i>{{ getStatus(run.state).label }}</span></td>
-              <td><span v-if="selectedRun?.id === run.id && progress !== null">{{ Math.round(progress) }}%</span><span v-else class="unavailable">暂无</span></td>
-              <td>API</td><td><span class="unavailable">待执行</span></td><td>{{ formatTime(run.created_at) }}</td><td><span class="unavailable">暂无</span></td>
-            </tr>
-          </tbody>
-        </table>
+      <div v-else class="run-results">
+        <div class="table-wrap" role="region" aria-label="测试运行列表，可横向滚动" tabindex="0">
+          <table>
+            <caption class="sr-only">测试运行列表</caption>
+            <thead><tr><th scope="col">运行</th><th scope="col">状态</th><th scope="col">进度</th><th scope="col">触发方式</th><th scope="col">环境</th><th scope="col">创建时间</th><th scope="col">耗时</th></tr></thead>
+            <tbody>
+              <tr v-for="run in paginatedRuns" :key="run.id" :class="{ selected: selectedRun?.id === run.id }" @click="selectRun(run)">
+                <td><button class="run-link" type="button" aria-controls="run-live-detail" :aria-expanded="selectedRun?.id === run.id" @click.stop="selectRun(run)"><strong>{{ run.engine }} 测试运行</strong><small>{{ run.id }}</small></button></td>
+                <td><span class="status-pill" :class="getStatus(run.state).tone"><i></i>{{ getStatus(run.state).label }}</span></td>
+                <td><span v-if="selectedRun?.id === run.id && progress !== null">{{ Math.round(progress) }}%</span><span v-else class="unavailable">暂无</span></td>
+                <td>API</td><td><span class="unavailable">待执行</span></td><td>{{ formatTime(run.created_at) }}</td><td><span class="unavailable">暂无</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <footer class="pagination" aria-label="运行列表分页">
+          <span>共 {{ filteredRuns.length }} 条</span>
+          <label>每页<select v-model.number="pageSize"><option :value="10">10</option><option :value="20">20</option><option :value="50">50</option></select>条</label>
+          <button type="button" :disabled="currentPage === 1" @click="currentPage -= 1">上一页</button>
+          <strong>第 {{ currentPage }} / {{ totalPages }} 页</strong>
+          <button type="button" :disabled="currentPage === totalPages" @click="currentPage += 1">下一页</button>
+        </footer>
       </div>
     </div>
 
@@ -375,8 +398,8 @@ onBeforeUnmount(() => {
       <p v-if="detailError" class="detail-error" role="alert">{{ detailError }}</p>
 
       <div class="event-columns">
-        <article class="event-card logs-card">
-          <header><h4>实时日志</h4><span>{{ logEvents.length }}</span></header>
+        <article class="event-card logs-card" :class="{ expanded: logsExpanded }">
+          <header><h4>实时日志</h4><div class="event-card-actions"><span>{{ logEvents.length }}</span><button type="button" @click="logsExpanded = !logsExpanded">{{ logsExpanded ? '收起' : '展开' }}</button></div></header>
           <ul v-if="logEvents.length" class="event-list" aria-live="polite">
             <li v-for="event in logEvents" :key="event.event_id"><time :datetime="event.occurred_at">{{ formatTime(event.occurred_at) }}</time><pre>{{ eventMessage(event) }}</pre></li>
           </ul>
@@ -406,8 +429,8 @@ onBeforeUnmount(() => {
 .service-banner{min-height:58px;padding:11px 15px;border:1px solid #dce8ff;border-radius:10px;background:#f5f8ff;display:flex;align-items:center;gap:11px;box-sizing:border-box}.service-banner .state-dot{width:9px;height:9px;border-radius:50%;background:#5d86ec;box-shadow:0 0 0 5px rgba(93,134,236,.12)}.service-banner>div{display:flex;flex:1;flex-direction:column}.service-banner strong{color:#395071;font-size:11px}.service-banner small{margin-top:2px;color:#7f8ca0;font-size:9px}.service-banner code{padding:4px 7px;border-radius:5px;color:#66758b;background:rgba(255,255,255,.7);font:9px ui-monospace,monospace}.service-banner.online{border-color:#d7eee6;background:#f2fbf8}.service-banner.online .state-dot{background:#26aa7a;box-shadow:0 0 0 5px rgba(38,170,122,.11)}.service-banner.offline{border-color:#f3dadd;background:#fff6f6}.service-banner.offline .state-dot{background:#db5c68;box-shadow:0 0 0 5px rgba(219,92,104,.1)}.service-banner.degraded{border-color:#f1e2bf;background:#fffaf0}.service-banner.degraded .state-dot{background:#e4a63f;box-shadow:0 0 0 5px rgba(228,166,63,.12)}
 .runs-panel{min-height:405px;border:1px solid #e5eaf2;border-radius:12px;background:#fff;overflow:hidden}.toolbar{min-height:69px;padding:12px 18px;border-bottom:1px solid #edf0f5;display:flex;align-items:center;justify-content:space-between;gap:16px;box-sizing:border-box}.toolbar>div:first-child{display:flex;align-items:center;gap:9px}.toolbar h3{margin:0;color:#293448;font-size:13px}.toolbar>div:first-child span{padding:3px 6px;border-radius:5px;color:#7b8798;background:#f0f3f7;font-size:9px}.filters{display:flex;gap:8px}.search-box{height:34px;width:220px;padding:0 10px;border:1px solid #e4e9f0;border-radius:7px;background:#fafbfd;display:flex;align-items:center;gap:7px}.search-box svg{width:14px;color:#9aa5b5}.search-box input{min-width:0;flex:1;border:0;outline:0;color:#3b4659;background:transparent;font:10px inherit}.filters select{height:34px;padding:0 28px 0 10px;border:1px solid #e4e9f0;border-radius:7px;color:#647085;background:#fafbfd;font:10px inherit}
 .state-view{min-height:334px;padding:30px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;box-sizing:border-box}.state-view>span:not(.loader){width:46px;height:46px;border-radius:14px;display:grid;place-items:center;color:#7588ac;background:#eff3f9;font-size:19px}.state-view strong{margin-top:13px;color:#435066;font-size:12px}.state-view p{max-width:390px;margin:5px 0 0;color:#9aa4b3;font-size:10px;line-height:1.6}.state-view button{margin-top:14px;padding:7px 13px;border:1px solid #d8e1f3;border-radius:7px;color:#5073cc;background:#f5f8ff;font:600 10px inherit;cursor:pointer}.state-view.compact{min-height:250px}.offline-view .offline-icon{color:#d45b67;background:#fff0f1}.loader{width:28px;height:28px;border:3px solid #e2e9f8;border-top-color:#5b80df;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-.table-wrap{overflow-x:auto}table{width:100%;min-width:850px;border-collapse:collapse;text-align:left}th{height:39px;padding:0 14px;color:#8e99aa;background:#fafbfd;font-size:9px;font-weight:650;letter-spacing:.03em}td{height:61px;padding:0 14px;border-top:1px solid #eff2f6;color:#5c687a;font-size:10px}tbody tr{cursor:pointer;transition:background .15s}tbody tr:hover,tbody tr.selected{background:#f7f9ff}.run-link{padding:0;border:0;background:transparent;text-align:left;cursor:pointer}.run-link:focus-visible{outline:2px solid #5279df;outline-offset:4px;border-radius:2px}.run-link strong{display:block;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344055;font:700 11px inherit}.run-link small{display:block;max-width:220px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;color:#9ba4b3;font:8px inherit}.status-pill{display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border-radius:20px;color:#69768a;background:#f0f3f6;font-size:9px}.status-pill i{width:5px;height:5px;border-radius:50%;background:currentColor}.status-pill.success{color:#29956f;background:#eaf8f3}.status-pill.running{color:#527bdd;background:#eaf0ff}.status-pill.pending{color:#bd842d;background:#fff4de}.status-pill.danger{color:#d35a66;background:#fff0f1}.unavailable{color:#8d98a9}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-.live-detail{border:1px solid #e1e7f1;border-radius:12px;background:#fff;box-shadow:0 12px 35px rgba(51,66,94,.08);overflow:hidden;outline:none}.live-detail:focus-visible{box-shadow:0 0 0 3px rgba(82,121,223,.18),0 12px 35px rgba(51,66,94,.08)}.detail-header{padding:16px 18px;border-bottom:1px solid #edf0f5;display:flex;align-items:center;justify-content:space-between}.detail-header>div>span{color:#6384dc;font-size:8px;font-weight:750;letter-spacing:.15em}.detail-header h3{margin:4px 0 2px;color:#293448;font-size:14px}.detail-header small{color:#98a2b1;font-size:8px}.detail-header button{width:30px;height:30px;border:1px solid #e4e9f0;border-radius:7px;color:#78869a;background:#fafbfd;display:grid;place-items:center;cursor:pointer}.detail-header button svg{width:13px;height:13px}.detail-summary{padding:14px 18px;display:grid;grid-template-columns:minmax(180px,1.7fr) repeat(3,minmax(80px,1fr));gap:10px}.connection-status,.detail-stat{min-height:53px;padding:10px 12px;border:1px solid #e9edf3;border-radius:8px;background:#fafbfd;box-sizing:border-box}.connection-status{display:flex;align-items:center;gap:10px}.connection-status>i{width:8px;height:8px;border-radius:50%;background:#99a4b3}.connection-status>span{display:flex;flex-direction:column}.connection-status strong,.detail-stat strong{color:#3b485c;font-size:10px}.connection-status small{margin-top:2px;color:#929dac;font-size:8px}.connection-status.live>i{background:#28a879;box-shadow:0 0 0 4px rgba(40,168,121,.1)}.connection-status.loading>i,.connection-status.connecting>i,.connection-status.reconnecting>i{background:#e1a23b;box-shadow:0 0 0 4px rgba(225,162,59,.1)}.connection-status.error>i{background:#d95c68}.detail-stat{display:flex;flex-direction:column;justify-content:center}.detail-stat span{margin-bottom:3px;color:#939ead;font-size:8px}.progress-track{padding:0 18px 15px}.progress-track>div{margin-bottom:6px;display:flex;justify-content:space-between;color:#718095;font-size:9px}.progress-track strong{color:#4c5d76}.progress-track progress{width:100%;height:7px;border:0;border-radius:10px;overflow:hidden;background:#edf1f7}.progress-track progress::-webkit-progress-bar{background:#edf1f7}.progress-track progress::-webkit-progress-value{border-radius:10px;background:#5d83e5}.progress-track progress::-moz-progress-bar{border-radius:10px;background:#5d83e5}.progress-track.empty progress{opacity:.55}.detail-error{margin:0 18px 14px;padding:9px 11px;border-radius:7px;color:#b94a55;background:#fff1f2;font-size:9px}.event-columns{padding:0 18px 18px;display:grid;grid-template-columns:1.35fr 1fr 1fr;gap:12px}.event-card{min-width:0;min-height:170px;border:1px solid #e9edf3;border-radius:9px;overflow:hidden}.event-card>header{height:42px;padding:0 12px;border-bottom:1px solid #edf0f5;background:#fafbfd;display:flex;align-items:center;justify-content:space-between}.event-card h4{margin:0;color:#435066;font-size:10px}.event-card header span{padding:2px 5px;border-radius:4px;color:#7b8798;background:#edf1f6;font-size:8px}.event-list,.asset-list{max-height:240px;margin:0;padding:0;overflow:auto;list-style:none}.event-list li,.asset-list li{padding:9px 11px;border-bottom:1px solid #f0f2f6}.event-list li:last-child,.asset-list li:last-child{border-bottom:0}.event-list time{display:block;margin-bottom:4px;color:#9aa4b3;font-size:8px}.event-list pre,.event-list p{margin:0;color:#536176;font:9px/1.55 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.error-list p{color:#b74e59}.asset-list li{display:flex;align-items:center;gap:7px;color:#69768a;font-size:9px}.asset-kind{flex:none;padding:3px 5px;border-radius:4px;color:#5c76b6;background:#edf2ff;font-size:8px}.asset-list a{color:#5279d7;font-weight:650;text-decoration:none}.asset-list a:hover{text-decoration:underline}.event-empty{margin:0;padding:38px 12px;color:#9ca6b4;text-align:center;font-size:9px}
+.table-wrap{overflow-x:auto}table{width:100%;min-width:850px;border-collapse:collapse;text-align:left}th{height:39px;padding:0 14px;color:#8e99aa;background:#fafbfd;font-size:9px;font-weight:650;letter-spacing:.03em}td{height:61px;padding:0 14px;border-top:1px solid #eff2f6;color:#5c687a;font-size:10px}tbody tr{cursor:pointer;transition:background .15s}tbody tr:hover,tbody tr.selected{background:#f7f9ff}.run-link{padding:0;border:0;background:transparent;text-align:left;cursor:pointer}.run-link:focus-visible{outline:2px solid #5279df;outline-offset:4px;border-radius:2px}.run-link strong{display:block;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344055;font:700 11px inherit}.run-link small{display:block;max-width:220px;margin-top:3px;overflow:hidden;text-overflow:ellipsis;color:#9ba4b3;font:8px inherit}.status-pill{display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border-radius:20px;color:#69768a;background:#f0f3f6;font-size:9px}.status-pill i{width:5px;height:5px;border-radius:50%;background:currentColor}.status-pill.success{color:#29956f;background:#eaf8f3}.status-pill.running{color:#527bdd;background:#eaf0ff}.status-pill.pending{color:#bd842d;background:#fff4de}.status-pill.danger{color:#d35a66;background:#fff0f1}.pagination{min-height:52px;padding:8px 14px;border-top:1px solid #edf0f5;display:flex;align-items:center;justify-content:flex-end;gap:10px;color:#7b8798;background:#fafbfd;box-sizing:border-box;font-size:10px}.pagination label{display:flex;align-items:center;gap:5px}.pagination select{height:28px;padding:0 22px 0 8px;border:1px solid #dfe5ee;border-radius:6px;color:#59677a;background:#fff;font:10px inherit}.pagination button{height:28px;padding:0 10px;border:1px solid #dce4f2;border-radius:6px;color:#5273cc;background:#fff;font:600 10px inherit;cursor:pointer}.pagination button:disabled{color:#aab2bf;background:#f3f5f8;cursor:not-allowed}.pagination strong{min-width:74px;color:#56647a;text-align:center}.unavailable{color:#8d98a9}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.live-detail{border:1px solid #e1e7f1;border-radius:12px;background:#fff;box-shadow:0 12px 35px rgba(51,66,94,.08);overflow:hidden;outline:none}.live-detail:focus-visible{box-shadow:0 0 0 3px rgba(82,121,223,.18),0 12px 35px rgba(51,66,94,.08)}.detail-header{padding:16px 18px;border-bottom:1px solid #edf0f5;display:flex;align-items:center;justify-content:space-between}.detail-header>div>span{color:#6384dc;font-size:8px;font-weight:750;letter-spacing:.15em}.detail-header h3{margin:4px 0 2px;color:#293448;font-size:14px}.detail-header small{color:#98a2b1;font-size:8px}.detail-header button{width:30px;height:30px;border:1px solid #e4e9f0;border-radius:7px;color:#78869a;background:#fafbfd;display:grid;place-items:center;cursor:pointer}.detail-header button svg{width:13px;height:13px}.detail-summary{padding:14px 18px;display:grid;grid-template-columns:minmax(180px,1.7fr) repeat(3,minmax(80px,1fr));gap:10px}.connection-status,.detail-stat{min-height:53px;padding:10px 12px;border:1px solid #e9edf3;border-radius:8px;background:#fafbfd;box-sizing:border-box}.connection-status{display:flex;align-items:center;gap:10px}.connection-status>i{width:8px;height:8px;border-radius:50%;background:#99a4b3}.connection-status>span{display:flex;flex-direction:column}.connection-status strong,.detail-stat strong{color:#3b485c;font-size:10px}.connection-status small{margin-top:2px;color:#929dac;font-size:8px}.connection-status.live>i{background:#28a879;box-shadow:0 0 0 4px rgba(40,168,121,.1)}.connection-status.loading>i,.connection-status.connecting>i,.connection-status.reconnecting>i{background:#e1a23b;box-shadow:0 0 0 4px rgba(225,162,59,.1)}.connection-status.error>i{background:#d95c68}.detail-stat{display:flex;flex-direction:column;justify-content:center}.detail-stat span{margin-bottom:3px;color:#939ead;font-size:8px}.progress-track{padding:0 18px 15px}.progress-track>div{margin-bottom:6px;display:flex;justify-content:space-between;color:#718095;font-size:9px}.progress-track strong{color:#4c5d76}.progress-track progress{width:100%;height:7px;border:0;border-radius:10px;overflow:hidden;background:#edf1f7}.progress-track progress::-webkit-progress-bar{background:#edf1f7}.progress-track progress::-webkit-progress-value{border-radius:10px;background:#5d83e5}.progress-track progress::-moz-progress-bar{border-radius:10px;background:#5d83e5}.progress-track.empty progress{opacity:.55}.detail-error{margin:0 18px 14px;padding:9px 11px;border-radius:7px;color:#b94a55;background:#fff1f2;font-size:9px}.event-columns{padding:0 18px 18px;display:grid;grid-template-columns:1fr 1fr;gap:12px}.event-card{min-width:0;min-height:170px;border:1px solid #e9edf3;border-radius:9px;overflow:hidden}.logs-card{grid-column:1/-1;min-height:320px}.event-card>header{height:42px;padding:0 12px;border-bottom:1px solid #edf0f5;background:#fafbfd;display:flex;align-items:center;justify-content:space-between}.event-card h4{margin:0;color:#435066;font-size:10px}.event-card header span{padding:2px 5px;border-radius:4px;color:#7b8798;background:#edf1f6;font-size:8px}.event-card-actions{display:flex;align-items:center;gap:8px}.event-card-actions button{padding:4px 9px;border:1px solid #dce4f2;border-radius:5px;color:#5273cc;background:#fff;font:600 9px inherit;cursor:pointer}.event-list,.asset-list{max-height:240px;margin:0;padding:0;overflow:auto;list-style:none}.logs-card .event-list{max-height:420px}.logs-card.expanded .event-list{max-height:68vh}.event-list li,.asset-list li{padding:9px 11px;border-bottom:1px solid #f0f2f6}.event-list li:last-child,.asset-list li:last-child{border-bottom:0}.event-list time{display:block;margin-bottom:4px;color:#9aa4b3;font-size:8px}.event-list pre,.event-list p{margin:0;color:#536176;font:10px/1.6 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.logs-card .event-list pre{font-size:12px;line-height:1.65}.error-list p{color:#b74e59}.asset-list li{display:flex;align-items:center;gap:7px;color:#69768a;font-size:9px}.asset-kind{flex:none;padding:3px 5px;border-radius:4px;color:#5c76b6;background:#edf2ff;font-size:8px}.asset-list a{color:#5279d7;font-weight:650;text-decoration:none}.asset-list a:hover{text-decoration:underline}.event-empty{margin:0;padding:38px 12px;color:#9ca6b4;text-align:center;font-size:9px}
 @media(max-width:850px){.event-columns{grid-template-columns:1fr 1fr}.logs-card{grid-column:1/-1}.detail-summary{grid-template-columns:1fr 1fr}.connection-status{grid-column:1/-1}}
 @media(max-width:700px){.page-heading{align-items:flex-start}.page-heading p{max-width:250px}.primary-button{padding:0 11px}.service-banner{align-items:flex-start;flex-wrap:wrap}.service-banner>div{flex-basis:calc(100% - 24px)}.service-banner code{margin-left:20px}.toolbar{align-items:flex-start;flex-direction:column}.filters{width:100%}.search-box{width:auto;flex:1}.runs-panel{min-height:380px}.state-view{min-height:280px}.event-columns{grid-template-columns:1fr}.logs-card{grid-column:auto}}
 @media(max-width:480px){.page-heading{display:block}.primary-button{margin-top:14px}.filters{flex-direction:column}.filters label,.filters select{width:100%;box-sizing:border-box}.service-banner code{display:none}}

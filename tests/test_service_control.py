@@ -45,6 +45,24 @@ def test_supervisor_uses_fixed_frontend_port(tmp_path) -> None:
     assert "--strictPort" in supervisor._commands["frontend"]
 
 
+def test_supervisor_survives_transient_heartbeat_write_failure(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    supervisor = PlatformSupervisor(tmp_path)
+    attempts = iter((PermissionError("temporarily locked"), None))
+
+    def write_heartbeat() -> None:
+        error = next(attempts)
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(supervisor, "_write_heartbeat", write_heartbeat)
+
+    assert supervisor._try_write_heartbeat(1.0) is False
+    assert supervisor._try_write_heartbeat(1.25) is True
+    assert "supervisor will retry" in capsys.readouterr().err
+
+
 def test_fresh_and_expired_heartbeat_are_bounded_and_type_safe(tmp_path) -> None:
     now = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
     current = [now]

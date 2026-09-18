@@ -6,6 +6,7 @@ import os
 import socket
 import stat
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from uuid import UUID, uuid4
 SCHEMA_VERSION = 1
 MAX_CONTROL_FILE_BYTES = 4096
 HEARTBEAT_INTERVAL_SECONDS = 1.0
+HEARTBEAT_WARNING_INTERVAL_SECONDS = 60.0
 LOOP_INTERVAL_SECONDS = 0.25
 RESTART_DELAY_SECONDS = 2
 TARGETS = {"frontend", "backend", "all"}
@@ -106,6 +108,7 @@ class PlatformSupervisor:
         self._request_path = self._control_root / "restart-request.json"
         self._processing_path = self._control_root / "restart-request.processing.json"
         self._heartbeat_path = self._control_root / "heartbeat.json"
+        self._last_heartbeat_warning = float("-inf")
         self._processes: dict[str, subprocess.Popen[bytes] | None] = {
             "frontend": None,
             "backend": None,
@@ -144,8 +147,8 @@ class PlatformSupervisor:
                 self._ensure_children_running()
                 monotonic_now = time.monotonic()
                 if monotonic_now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
-                    self._write_heartbeat()
-                    last_heartbeat = monotonic_now
+                    if self._try_write_heartbeat(monotonic_now):
+                        last_heartbeat = monotonic_now
                 if pending is None and self._claim_request():
                     pending = parse_control_request(self._processing_path)
                     if pending is None:
@@ -189,6 +192,23 @@ class PlatformSupervisor:
             "schema_version": SCHEMA_VERSION,
             "heartbeat_at": datetime.now(timezone.utc).isoformat(),
         })
+
+    def _try_write_heartbeat(self, monotonic_now: float) -> bool:
+        try:
+            self._write_heartbeat()
+        except OSError as error:
+            if (
+                monotonic_now - self._last_heartbeat_warning
+                >= HEARTBEAT_WARNING_INTERVAL_SECONDS
+            ):
+                print(
+                    f"Heartbeat write failed; supervisor will retry: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._last_heartbeat_warning = monotonic_now
+            return False
+        return True
 
     def _claim_request(self) -> bool:
         if self._processing_path.exists():

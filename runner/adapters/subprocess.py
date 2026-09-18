@@ -5,8 +5,10 @@ import os
 import signal
 import subprocess
 import sys
+from collections.abc import Callable
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from threading import Lock, Thread
 from typing import Mapping
 
 from packages.protocol import ResultOutcome, TaskEnvelope
@@ -45,6 +47,27 @@ _SAFE_ENVIRONMENT_NAMES = (
     "WINDIR",
 )
 _RUNNER_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+_LOG_CHUNK_SIZE = 4096
+
+OutputSink = Callable[[str, str], None]
+
+
+class _BoundedOutput:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._parts: list[str] = []
+        self._length = 0
+
+    def append(self, value: str) -> None:
+        # Retain one extra character so truncate() can detect overflow.
+        remaining = self._limit + 1 - self._length
+        if remaining > 0:
+            saved = value[:remaining]
+            self._parts.append(saved)
+            self._length += len(saved)
+
+    def value(self) -> str:
+        return truncate("".join(self._parts), self._limit)
 
 
 class SubprocessAdapter:
@@ -86,6 +109,7 @@ class SubprocessAdapter:
         environment["SMARTTEST_PARAMETERS_FILE"] = str(parameters_file)
         environment["PYTHONIOENCODING"] = "utf-8"
         environment["PYTHONUTF8"] = "1"
+        environment["PYTHONUNBUFFERED"] = "1"
         if self.artifact_root is not None:
             environment["SMARTTEST_ARTIFACTS_DIR"] = str(self.artifact_root.resolve())
         return environment
@@ -116,7 +140,8 @@ class SubprocessAdapter:
                 pass
 
     def _run_command(
-        self, command: list[str], workspace: Path, environment: Mapping[str, str], timeout: float
+        self, command: list[str], workspace: Path, environment: Mapping[str, str],
+        timeout: float, output_sink: OutputSink | None = None,
     ) -> subprocess.CompletedProcess[str]:
         process_options: dict[str, object] = {}
         if os.name == "nt":
@@ -135,6 +160,8 @@ class SubprocessAdapter:
             shell=False,
             **process_options,
         )
+        if output_sink is not None:
+            return self._stream_process(process, command, timeout, output_sink)
         try:
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
@@ -149,7 +176,92 @@ class SubprocessAdapter:
             ) from None
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
+    def _stream_process(
+        self, process: subprocess.Popen[str], command: list[str], timeout: float,
+        output_sink: OutputSink,
+    ) -> subprocess.CompletedProcess[str]:
+        stdout = _BoundedOutput(self.output_limit)
+        stderr = _BoundedOutput(self.output_limit)
+        reader_errors: list[Exception] = []
+        reader_errors_lock = Lock()
+
+        def save_reader_error(error: Exception) -> None:
+            with reader_errors_lock:
+                reader_errors.append(error)
+
+        def read_stream(name: str, stream: object, captured: _BoundedOutput) -> None:
+            emitted = 0
+            truncated_event_emitted = False
+            sink_enabled = True
+            try:
+                for line in stream:  # type: ignore[union-attr]
+                    captured.append(line)
+                    message = line.rstrip("\r\n")
+                    remaining = max(0, self.output_limit - emitted)
+                    visible = message[:remaining]
+                    if visible and sink_enabled:
+                        try:
+                            for offset in range(0, len(visible), _LOG_CHUNK_SIZE):
+                                output_sink(name, visible[offset:offset + _LOG_CHUNK_SIZE])
+                        except Exception as exc:
+                            save_reader_error(exc)
+                            sink_enabled = False
+                    emitted += min(len(line), remaining)
+                    if len(line) > remaining and not truncated_event_emitted:
+                        if sink_enabled:
+                            try:
+                                output_sink(name, "...[truncated]")
+                            except Exception as exc:
+                                save_reader_error(exc)
+                                sink_enabled = False
+                        truncated_event_emitted = True
+            except Exception as exc:
+                save_reader_error(exc)
+
+        assert process.stdout is not None and process.stderr is not None
+        readers = [
+            Thread(target=read_stream, args=("stdout", process.stdout, stdout), daemon=True),
+            Thread(target=read_stream, args=("stderr", process.stderr, stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        timed_out = False
+        try:
+            return_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._terminate_process_tree(process)
+            try:
+                return_code = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait()
+        finally:
+            for reader in readers:
+                reader.join(timeout=5)
+        if any(reader.is_alive() for reader in readers):
+            raise OSError("subprocess output streams did not close")
+        if reader_errors and not timed_out:
+            raise reader_errors[0]
+        if timed_out:
+            raise subprocess.TimeoutExpired(
+                command, timeout, output=stdout.value(), stderr=stderr.value()
+            )
+        return subprocess.CompletedProcess(
+            command, return_code, stdout.value(), stderr.value()
+        )
+
     def run(self, task: TaskEnvelope, workspace: Path) -> AdapterResult:
+        return self._run(task, workspace, None)
+
+    def run_streaming(
+        self, task: TaskEnvelope, workspace: Path, output_sink: OutputSink,
+    ) -> AdapterResult:
+        return self._run(task, workspace, output_sink)
+
+    def _run(
+        self, task: TaskEnvelope, workspace: Path, output_sink: OutputSink | None,
+    ) -> AdapterResult:
         try:
             deadline_remaining(task)
         except TimeoutError:
@@ -184,9 +296,14 @@ class SubprocessAdapter:
                         stream, ensure_ascii=False, allow_nan=False,
                         separators=(",", ":"),
                     )
-                completed = self._run_command(
+                arguments = (
                     self.command(entrypoint), workspace,
                     self.environment(task, workspace, parameters_file), timeout,
+                )
+                completed = (
+                    self._run_command(*arguments)
+                    if output_sink is None
+                    else self._run_command(*arguments, output_sink)
                 )
         except subprocess.TimeoutExpired as exc:
             return AdapterResult(

@@ -7,6 +7,8 @@ import AutomationView from './components/AutomationView.vue'
 import DashboardView from './components/DashboardView.vue'
 import DataFactoryView from './components/DataFactoryView.vue'
 import ExecutionCenter from './components/ExecutionCenter.vue'
+import EnvironmentView from './components/EnvironmentView.vue'
+import LoadTestingView from './components/LoadTestingView.vue'
 import PlaceholderView from './components/PlaceholderView.vue'
 import TestPlanView from './components/TestPlanView.vue'
 import VersionControlView from './components/VersionControlView.vue'
@@ -223,6 +225,18 @@ onBeforeUnmount(() => {
         />
         <DataFactoryView
           v-else-if="activePage === 'data-factory'"
+          :project-id="selectedProjectId"
+          :projects-loading="projectsLoading"
+          :projects-error="projectsError"
+        />
+        <LoadTestingView
+          v-else-if="activePage === 'load-testing'"
+          :project-id="selectedProjectId"
+          :projects-loading="projectsLoading"
+          :projects-error="projectsError"
+        />
+        <EnvironmentView
+          v-else-if="activePage === 'environments'"
           :project-id="selectedProjectId"
           :projects-loading="projectsLoading"
           :projects-error="projectsError"
