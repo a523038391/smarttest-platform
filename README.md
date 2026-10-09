@@ -114,6 +114,10 @@ Vite 默认代理 `/api` 与 `/health` 到 `http://127.0.0.1:8000`，可通过 `
 
     powershell -ExecutionPolicy Bypass -File .\scripts\start_platform.ps1 -WaitForExit
 
+推荐使用内置安装脚本注册长期运行任务。任务会在登录时启动、异常退出后每分钟重试，并每五分钟执行一次自愈检查；已经运行时不会重复启动：
+
+    powershell -ExecutionPolicy Bypass -File .\scripts\install_platform_task.ps1
+
 守护脚本固定从仓库根启动后端 `.venv\Scripts\python.exe -m uvicorn services.api.app:app --host 127.0.0.1 --port 8000`，并从 `apps/web` 启动 `npm.cmd run dev -- --host 127.0.0.1`。子进程异常退出会自动拉起，按 `Ctrl+C` 会清理前后端进程树。脚本自动创建 `.service-control`，向子进程注入服务控制配置，并将 `RUNNER_NETWORK` 固定为 `bridge`，使隔离 Runner 可访问外部被测服务。
 
 `/api/v1/service-control/*` 仅允许管理员访问；`AUTH_REQUIRED=false` 只为隔离的本地开发和自动化测试兼容。API 只接受 `frontend`、`backend`、`all` 三个固定目标，不接受命令、PID、工作目录或路径。控制文件最大 4 KiB，使用固定 schema 和原子替换，心跳超过 5 秒即判定守护离线。Web/API 不能修改守护脚本的固定启动命令；不要将服务控制目录放在共享或不受信任的位置，也不要在生产或多用户主机上启用此本地开发能力。
