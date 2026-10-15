@@ -36,6 +36,7 @@ def empty_metrics(target_names: list[str] | None = None) -> dict[str, Any]:
         "scenarios_per_second": 0.0, "average_ms": 0.0, "p50_ms": 0.0,
         "p95_ms": 0.0, "p99_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0,
     }
+    base["response_samples"] = {"successful": [], "failed": []}
     return base
 
 

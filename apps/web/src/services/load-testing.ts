@@ -1,6 +1,6 @@
 import type {
   HttpMethod, JsonObject, JsonValue, LoadTestCreateInput, LoadTestDefinition,
-  LoadTestMetrics, LoadTestMode, LoadTestRun, LoadTestRunStatus, LoadTestTarget,
+  LoadTestMetrics, LoadTestMode, LoadTestResponseSample, LoadTestRun, LoadTestRunStatus, LoadTestTarget,
   LoadTestTrafficMode, LoadTestUpdateInput,
 } from '../types/load-testing'
 
@@ -43,6 +43,20 @@ function isNumberMap(value: unknown): value is Record<string, number> {
 
 function isStringMap(value: unknown): value is Record<string, string> {
   return isRecord(value) && Object.values(value).every((item) => typeof item === 'string')
+}
+
+function parseResponseSample(value: unknown): LoadTestResponseSample | null {
+  const bodyKinds = ['json', 'empty', 'non_json', 'truncated', 'unavailable']
+  if (!isRecord(value) || typeof value.target !== 'string' || !value.target
+    || !(value.status === null || (isInteger(value.status, 100) && value.status <= 599))
+    || !isFiniteNumber(value.latency_ms) || !(value.error === null || typeof value.error === 'string')
+    || !isJsonValue(value.body) || !bodyKinds.includes(value.body_kind as string)
+    || typeof value.truncated !== 'boolean') return null
+  return {
+    target: value.target, status: value.status as number | null, latency_ms: value.latency_ms,
+    error: value.error as string | null, body: value.body,
+    body_kind: value.body_kind as LoadTestResponseSample['body_kind'], truncated: value.truncated,
+  }
 }
 
 function parseTarget(value: unknown): LoadTestTarget | null {
@@ -134,12 +148,24 @@ function parseMetrics(value: unknown): LoadTestMetrics | null {
       p95_ms: rawScenarioMetrics.p95_ms, p99_ms: rawScenarioMetrics.p99_ms,
     }
   }
+  const rawSamples = value.response_samples
+  const responseSamples: LoadTestMetrics['response_samples'] = { successful: [], failed: [] }
+  if (rawSamples !== undefined) {
+    if (!isRecord(rawSamples) || !Array.isArray(rawSamples.successful)
+      || !Array.isArray(rawSamples.failed)) return null
+    const successful = rawSamples.successful.map(parseResponseSample)
+    const failed = rawSamples.failed.map(parseResponseSample)
+    if (successful.some((item) => item === null) || failed.some((item) => item === null)) return null
+    responseSamples.successful = successful as LoadTestResponseSample[]
+    responseSamples.failed = failed as LoadTestResponseSample[]
+  }
   return { total_requests: value.total_requests, successful_requests: value.successful_requests,
     failed_requests: value.failed_requests, requests_per_second: value.requests_per_second,
     average_ms: value.average_ms, min_ms: value.min_ms, max_ms: value.max_ms,
     p50_ms: value.p50_ms, p95_ms: value.p95_ms, p99_ms: value.p99_ms,
     status_counts: value.status_counts, error_counts: value.error_counts,
-    target_metrics: targetMetrics, scenario_metrics: scenarioMetrics }
+    target_metrics: targetMetrics, scenario_metrics: scenarioMetrics,
+    response_samples: responseSamples }
 }
 
 function parseRun(value: unknown): LoadTestRun | null {

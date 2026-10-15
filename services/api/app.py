@@ -269,7 +269,9 @@ def create_app(
         load_test_repository = (
             SqlLoadTestRepository(sessions) if sessions else LoadTestRepository()
         )
-    load_test_executor = load_test_executor or LoadTestExecutor()
+    load_test_executor = load_test_executor or LoadTestExecutor(
+        allowed_private_hosts=resolved_settings.load_test_private_host_allowlist
+    )
     load_test_service = load_test_service or LoadTestService(
         load_test_repository, load_test_executor,
         environment_repository=environment_repository,

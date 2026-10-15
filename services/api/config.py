@@ -2,6 +2,7 @@ import base64
 import binascii
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,10 @@ MAX_SESSION_TTL_SECONDS = 31_536_000
 DEFAULT_RUNNER_MAX_WORKERS = 2
 MAX_RUNNER_WORKERS = 16
 DEFAULT_RUNNER_POLL_INTERVAL_SECONDS = 0.5
+_HOSTNAME = re.compile(
+    r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
 
 
 def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
@@ -62,6 +67,7 @@ class Settings:
     service_control_enabled: bool = False
     service_control_root: str | None = None
     version_control_auto_restart: bool = False
+    load_test_private_host_allowlist: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         configured_text = {
@@ -153,6 +159,14 @@ class Settings:
             raise ValueError(
                 "VERSION_CONTROL_AUTO_RESTART requires SERVICE_CONTROL_ENABLED=true"
             )
+        if any(
+            not isinstance(host, str) or host != host.strip().lower()
+            or not _HOSTNAME.fullmatch(host) or host == "localhost"
+            for host in self.load_test_private_host_allowlist
+        ):
+            raise ValueError(
+                "LOAD_TEST_PRIVATE_HOST_ALLOWLIST must contain lowercase hostnames"
+            )
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -229,5 +243,10 @@ class Settings:
             ),
             version_control_auto_restart=_boolean(
                 env, "VERSION_CONTROL_AUTO_RESTART", False
+            ),
+            load_test_private_host_allowlist=tuple(
+                host.strip().lower()
+                for host in env.get("LOAD_TEST_PRIVATE_HOST_ALLOWLIST", "").split(",")
+                if host.strip()
             ),
         )

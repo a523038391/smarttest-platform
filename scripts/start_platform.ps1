@@ -47,6 +47,7 @@ $env:SECRET_ENCRYPTION_KEY_ID = 'windows-dpapi-v1'
 $env:VERSION_CONTROL_ENABLED = 'true'
 $env:VERSION_CONTROL_ROOT = $repositoryRoot
 $env:RUNNER_NETWORK = 'bridge'
+$env:LOAD_TEST_PRIVATE_HOST_ALLOWLIST = 'erp-test.wecharmer.cn'
 
 $startArguments = @{
     FilePath = $pythonExecutable

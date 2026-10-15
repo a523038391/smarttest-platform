@@ -1,6 +1,8 @@
 """Resolve project environment conventions into safe load-test runtime auth."""
 from dataclasses import dataclass, field
 from enum import Enum
+import json
+from typing import Any
 from uuid import UUID
 
 from packages.protocol import SecretReference
@@ -24,6 +26,7 @@ class LoadTestAuthConfiguration:
     login_url: str | None = None
     account_field: str = "username"
     password_field: str = "password"
+    login_body: dict[str, Any] = field(default_factory=dict, repr=False)
     token_path: str = "data.token"
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer"
@@ -35,7 +38,7 @@ class LoadTestAuthConfiguration:
 EnvironmentRepositoryLike = EnvironmentRepository | SqlEnvironmentRepository
 _PUBLIC_KEYS = {
     "BASE_URL", "AUTH_MODE", "LOGIN_URL", "ACCOUNT_FIELD", "PASSWORD_FIELD",
-    "TOKEN_PATH", "AUTH_HEADER", "AUTH_PREFIX",
+    "LOGIN_BODY", "TOKEN_PATH", "AUTH_HEADER", "AUTH_PREFIX",
 }
 _SECRET_KEYS = {"AUTH_TOKEN", "AUTH_ACCOUNT", "AUTH_PASSWORD"}
 
@@ -94,17 +97,30 @@ class LoadTestAuthResolver:
         login_url = self._optional_string(public, "LOGIN_URL")
         if mode is LoadTestAuthMode.LOGIN and not login_url:
             raise EnvironmentConflict("LOGIN_URL is required for LOGIN authentication")
+        login_body = self._login_body(public)
         return LoadTestAuthConfiguration(
             base_url=self._optional_string(public, "BASE_URL"), mode=mode,
             login_url=login_url,
             account_field=self._string(public, "ACCOUNT_FIELD", "username"),
             password_field=self._string(public, "PASSWORD_FIELD", "password"),
+            login_body=login_body,
             token_path=self._string(public, "TOKEN_PATH", "data.token"),
             auth_header=self._string(public, "AUTH_HEADER", "Authorization"),
             auth_prefix=self._string(public, "AUTH_PREFIX", "Bearer", allow_empty=True),
             token=resolved.get("AUTH_TOKEN"), account=resolved.get("AUTH_ACCOUNT"),
             password=resolved.get("AUTH_PASSWORD"),
         )
+
+    @staticmethod
+    def _login_body(values: dict[str, str]) -> dict[str, Any]:
+        raw = values.get("LOGIN_BODY", "{}")
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            raise EnvironmentConflict("LOGIN_BODY must be a JSON object") from None
+        if not isinstance(parsed, dict) or any(not isinstance(key, str) for key in parsed):
+            raise EnvironmentConflict("LOGIN_BODY must be a JSON object")
+        return parsed
 
     @staticmethod
     def _optional_string(values: dict[str, str], key: str) -> str | None:

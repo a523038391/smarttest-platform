@@ -30,6 +30,12 @@ Resolver = Callable[[str], Iterable[str]]
 SnapshotCallable = Callable[[dict[str, Any]], None]
 _SAMPLE_LIMIT = 10_000
 _RESPONSE_LIMIT = 1_048_576
+_RESPONSE_PREVIEW_BYTES = 8_192
+_SUCCESS_RESPONSE_SAMPLES = 5
+_FAILED_RESPONSE_SAMPLES = 10
+_SENSITIVE_RESPONSE_KEYS = (
+    "authorization", "cookie", "password", "passwd", "secret", "token",
+)
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _EXPLICITLY_BLOCKED_NETWORKS = (
     ip_network("0.0.0.0/8"),
@@ -39,7 +45,11 @@ _EXPLICITLY_BLOCKED_NETWORKS = (
 
 
 class LoadTestExecutionError(ValueError):
-    pass
+    def __init__(self, message: str, *, code: str = "execution_error",
+                 status: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
 
 
 @dataclass
@@ -97,17 +107,37 @@ class _Metrics:
         self._all = _MetricValues()
         self._targets = {name: _MetricValues() for name in target_names}
         self._scenarios = _MetricValues()
+        self._response_samples: dict[str, list[dict[str, Any]]] = {
+            "successful": [], "failed": [],
+        }
         self._last_snapshot = started
 
     def add(self, name: str, latency: float, success: bool,
-            status: int | None, error: str | None) -> None:
+            status: int | None, error: str | None,
+            response: dict[str, Any] | None = None) -> None:
         with self._lock:
             self._all.add(latency, success, status, error)
             self._targets[name].add(latency, success, status, error)
+            category = "successful" if success else "failed"
+            limit = _SUCCESS_RESPONSE_SAMPLES if success else _FAILED_RESPONSE_SAMPLES
+            if len(self._response_samples[category]) < limit:
+                details = response or {
+                    "body": None, "body_kind": "unavailable", "truncated": False,
+                }
+                self._response_samples[category].append({
+                    "target": name, "status": status, "latency_ms": round(latency, 3),
+                    "error": error, **deepcopy(details),
+                })
 
     def add_scenario(self, latency: float, success: bool) -> None:
         with self._lock:
             self._scenarios.add(latency, success, None, None)
+
+    def should_capture(self, success: bool) -> bool:
+        with self._lock:
+            category = "successful" if success else "failed"
+            limit = _SUCCESS_RESPONSE_SAMPLES if success else _FAILED_RESPONSE_SAMPLES
+            return len(self._response_samples[category]) < limit
 
     def periodic_snapshot(self) -> dict[str, Any] | None:
         with self._lock:
@@ -131,13 +161,14 @@ class _Metrics:
         result["scenario_metrics"] = self._summarize_scenarios(
             self._scenarios, elapsed,
         )
+        result["response_samples"] = deepcopy(self._response_samples)
         return result
 
     @staticmethod
     def _summarize(values: _MetricValues, elapsed: float) -> dict[str, Any]:
         if not values.total:
             return {key: value for key, value in empty_metrics().items()
-                    if key not in {"target_metrics", "scenario_metrics"}}
+                    if key not in {"target_metrics", "scenario_metrics", "response_samples"}}
         ordered = sorted(values.latencies)
 
         def percentile(ratio: float) -> float:
@@ -183,12 +214,31 @@ class _Metrics:
 
 class LoadTestExecutor:
     def __init__(self, request_callable: RequestCallable | None = None,
-                 resolver: Resolver | None = None, max_workers: int = 100) -> None:
+                 resolver: Resolver | None = None, max_workers: int = 100,
+                 allowed_private_hosts: Iterable[str] = ()) -> None:
         if not 1 <= max_workers <= 100:
             raise ValueError("max_workers must be between 1 and 100")
         self._request = request_callable
         self._resolver = resolver or _system_resolver
         self._max_workers = max_workers
+        self._allowed_private_hosts = frozenset(
+            host.strip().lower() for host in allowed_private_hosts
+        )
+
+    def test_authentication(
+        self, config: LoadTestAuthConfiguration, timeout: float = 10
+    ) -> LoadTestAuthMode:
+        if not 0.1 <= timeout <= 60 or config.mode is None or not config.base_url:
+            raise LoadTestExecutionError("Load test authentication configuration is invalid")
+        if config.mode is LoadTestAuthMode.TOKEN:
+            self._validate_public_url(config.base_url)
+        token = self._authentication_token(config, timeout)
+        if token is None:
+            raise LoadTestExecutionError("Load test authentication configuration is invalid")
+        self._validated_headers({
+            config.auth_header: f"{config.auth_prefix} {token}".strip()
+        })
+        return config.mode
 
     def execute(self, definition: LoadTestRecord, *, cancel_event: Event | None = None,
                 snapshot_callback: SnapshotCallable | None = None,
@@ -223,11 +273,12 @@ class LoadTestExecutor:
                 target_index = index % len(definition.targets)
                 target = prepared_targets[target_index]
                 before = time.monotonic()
-                status, success, error = self._request_target(
-                    target, destinations[target_index], definition.timeout_seconds
+                status, success, error, response = self._request_target(
+                    target, destinations[target_index], definition.timeout_seconds,
+                    metrics.should_capture,
                 )
-                metrics.add(target["name"], (time.monotonic() - before) * 1000,
-                            success, status, error)
+                latency = (time.monotonic() - before) * 1000
+                metrics.add(target["name"], latency, success, status, error, response)
                 snapshot = metrics.periodic_snapshot()
                 if snapshot is not None and snapshot_callback is not None:
                     snapshot_callback(snapshot)
@@ -284,14 +335,15 @@ class LoadTestExecutor:
                         break
                     before = time.monotonic()
                     status: int | None = None
+                    response: dict[str, Any] | None = None
                     try:
                         target = self._render_scenario_target(raw_target, variables)
                         target = self._prepare_target(target, auth_config)
                         if token is not None and auth_config is not None:
                             target = self._inject_auth(target, auth_config, token)
                         destination = self._validate_public_url(target["url"])
-                        status, success, error, extracted = self._request_scenario_target(
-                            target, destination, definition.timeout_seconds,
+                        status, success, error, extracted, response = self._request_scenario_target(
+                            target, destination, definition.timeout_seconds, metrics.should_capture,
                         )
                         if success:
                             variables.update(extracted)
@@ -299,10 +351,8 @@ class LoadTestExecutor:
                         success, error = False, "template_error"
                     except (KeyError, TypeError, ValueError):
                         success, error = False, "request_error"
-                    metrics.add(
-                        raw_target["name"], (time.monotonic() - before) * 1000,
-                        success, status, error,
-                    )
+                    latency = (time.monotonic() - before) * 1000
+                    metrics.add(raw_target["name"], latency, success, status, error, response)
                     if not success:
                         scenario_success = False
                     snapshot = metrics.periodic_snapshot()
@@ -388,13 +438,18 @@ class LoadTestExecutor:
         response = None
         try:
             if not config.login_url or config.account is None or config.password is None:
-                raise ValueError
+                raise LoadTestExecutionError(
+                    "Load test login configuration is incomplete",
+                    code="login_configuration_invalid",
+                )
             url = self._resolve_url(config.login_url, config.base_url)
             destination = self._validate_public_url(url)
+            body = deepcopy(config.login_body)
+            body[config.account_field] = config.account
+            body[config.password_field] = config.password
             target = {
                 "method": "POST", "url": url, "headers": {}, "query": {},
-                "body": {config.account_field: config.account,
-                         config.password_field: config.password},
+                "body": body,
             }
             if self._request is None:
                 response = self._request_pinned(*destination, target, timeout)
@@ -406,14 +461,40 @@ class LoadTestExecutor:
             raw_status = getattr(response, "status_code", None)
             status = int(raw_status if raw_status is not None else response.status)
             if status < 200 or status >= 300:
-                raise ValueError
-            payload = json.loads(self._read_limited_body(response).decode("utf-8"))
-            token = self._extract_token(payload, config.token_path)
+                raise LoadTestExecutionError(
+                    "Load test login returned an unsuccessful status",
+                    code="login_http_error", status=status,
+                )
+            try:
+                payload = json.loads(self._read_limited_body(response).decode("utf-8"))
+            except (TypeError, ValueError, UnicodeError):
+                raise LoadTestExecutionError(
+                    "Load test login response is not valid JSON",
+                    code="login_response_invalid",
+                ) from None
+            try:
+                token = self._extract_token(payload, config.token_path)
+            except (TypeError, ValueError):
+                raise LoadTestExecutionError(
+                    "Load test login token path was not found",
+                    code="login_token_path_missing",
+                ) from None
             if not isinstance(token, str) or not token:
-                raise ValueError
+                raise LoadTestExecutionError(
+                    "Load test login token is not a non-empty string",
+                    code="login_token_invalid",
+                )
             return token
+        except LoadTestExecutionError as exc:
+            if exc.code.startswith("login_"):
+                raise
+            raise LoadTestExecutionError(
+                "Load test login request failed", code="login_request_failed"
+            ) from None
         except Exception:
-            raise LoadTestExecutionError("Load test authentication failed") from None
+            raise LoadTestExecutionError(
+                "Load test login request failed", code="login_request_failed"
+            ) from None
         finally:
             if response is not None and callable(getattr(response, "close", None)):
                 response.close()
@@ -479,7 +560,9 @@ class LoadTestExecutor:
         return headers
 
     def _request_target(self, target: dict[str, Any], destination: tuple[Any, tuple[Any, ...]],
-                        timeout: float) -> tuple[int | None, bool, str | None]:
+                        timeout: float, should_capture: Callable[[bool], bool]) -> tuple[
+                            int | None, bool, str | None, dict[str, Any] | None,
+                        ]:
         response = None
         try:
             parsed, addresses = destination
@@ -495,18 +578,22 @@ class LoadTestExecutor:
             raw_status = getattr(response, "status_code", None)
             status = int(raw_status if raw_status is not None else response.status)
             success = status in set(target["expected_statuses"])
-            return status, success, None if success else "unexpected_status"
+            details = (
+                self._response_preview(self._read_preview_body(response))
+                if should_capture(success) else None
+            )
+            return status, success, None if success else "unexpected_status", details
         except (requests.RequestException, urllib3.exceptions.HTTPError,
                 OSError, TypeError, ValueError):
-            return None, False, "request_error"
+            return None, False, "request_error", None
         finally:
             if response is not None and callable(getattr(response, "close", None)):
                 response.close()
 
     def _request_scenario_target(
         self, target: dict[str, Any], destination: tuple[Any, tuple[Any, ...]],
-        timeout: float,
-    ) -> tuple[int | None, bool, str | None, dict[str, Any]]:
+        timeout: float, should_capture: Callable[[bool], bool],
+    ) -> tuple[int | None, bool, str | None, dict[str, Any], dict[str, Any] | None]:
         response = None
         try:
             parsed, addresses = destination
@@ -522,24 +609,84 @@ class LoadTestExecutor:
             raw_status = getattr(response, "status_code", None)
             status = int(raw_status if raw_status is not None else response.status)
             if status not in set(target["expected_statuses"]):
-                return status, False, "unexpected_status", {}
+                details = (
+                    self._response_preview(self._read_preview_body(response))
+                    if should_capture(False) else None
+                )
+                return status, False, "unexpected_status", {}, details
             if not target["extractors"]:
-                return status, True, None, {}
+                details = (
+                    self._response_preview(self._read_preview_body(response))
+                    if should_capture(True) else None
+                )
+                return status, True, None, {}, details
             try:
-                payload = json.loads(self._read_limited_body(response))
+                raw_body = self._read_limited_body(response)
+                payload = json.loads(raw_body)
                 extracted = {
                     name: deepcopy(self._extract_token(payload, path))
                     for name, path in target["extractors"].items()
                 }
             except (TypeError, ValueError, UnicodeError):
-                return status, False, "extractor_error", {}
-            return status, True, None, extracted
+                return status, False, "extractor_error", {}, None
+            return status, True, None, extracted, self._response_preview(raw_body)
         except (requests.RequestException, urllib3.exceptions.HTTPError,
                 OSError, TypeError, ValueError):
-            return None, False, "request_error", {}
+            return None, False, "request_error", {}, None
         finally:
             if response is not None and callable(getattr(response, "close", None)):
                 response.close()
+
+    @staticmethod
+    def _read_preview_body(response: Any) -> bytes:
+        source = getattr(response, "response", response)
+        limit = _RESPONSE_PREVIEW_BYTES + 1
+        if callable(getattr(source, "read", None)):
+            body = source.read(limit)
+        elif callable(getattr(source, "iter_content", None)):
+            chunks, size = [], 0
+            for chunk in source.iter_content(chunk_size=4_096):
+                chunks.append(chunk)
+                size += len(chunk)
+                if size >= limit:
+                    break
+            body = b"".join(chunks)[:limit]
+        elif callable(getattr(source, "json", None)):
+            body = json.dumps(source.json(), ensure_ascii=False).encode("utf-8")[:limit]
+        else:
+            body = getattr(source, "content", b"")[:limit]
+        if not isinstance(body, bytes):
+            raise ValueError
+        return body
+
+    @classmethod
+    def _response_preview(cls, raw: bytes) -> dict[str, Any]:
+        truncated = len(raw) > _RESPONSE_PREVIEW_BYTES
+        preview = raw[:_RESPONSE_PREVIEW_BYTES]
+        if not preview:
+            return {"body": None, "body_kind": "empty", "truncated": False}
+        if truncated:
+            return {"body": None, "body_kind": "truncated", "truncated": True}
+        try:
+            payload = json.loads(preview.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return {"body": None, "body_kind": "non_json", "truncated": False}
+        return {
+            "body": cls._redact_response(payload), "body_kind": "json", "truncated": False,
+        }
+
+    @classmethod
+    def _redact_response(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: ("[REDACTED]" if any(marker in key.lower()
+                                            for marker in _SENSITIVE_RESPONSE_KEYS)
+                      else cls._redact_response(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._redact_response(item) for item in value]
+        return value
 
     def _request_pinned(self, parsed: Any, addresses: tuple[Any, ...],
                         target: dict[str, Any], timeout: float) -> Any:
@@ -601,6 +748,20 @@ class LoadTestExecutor:
             and not candidate.is_unspecified
         )
 
+    @staticmethod
+    def _is_allowed_private_address(address: Any) -> bool:
+        mapped = getattr(address, "ipv4_mapped", None)
+        candidate = mapped or address
+        return bool(
+            not any(candidate in network for network in _EXPLICITLY_BLOCKED_NETWORKS
+                    if candidate.version == network.version)
+            and not candidate.is_loopback
+            and not candidate.is_link_local
+            and not candidate.is_multicast
+            and not candidate.is_reserved
+            and not candidate.is_unspecified
+        )
+
     def _validate_public_url(self, url: str) -> tuple[Any, tuple[Any, ...]]:
         try:
             parsed = urlsplit(url)
@@ -613,7 +774,11 @@ class LoadTestExecutor:
                 addresses = (ip_address(parsed.hostname),)
             except ValueError:
                 addresses = tuple(ip_address(item) for item in self._resolver(parsed.hostname))
-            if not addresses or any(not self._is_public_address(address) for address in addresses):
+            private_allowed = parsed.hostname.lower() in self._allowed_private_hosts
+            address_allowed = (
+                self._is_allowed_private_address if private_allowed else self._is_public_address
+            )
+            if not addresses or any(not address_allowed(address) for address in addresses):
                 raise ValueError
             return parsed, addresses
         except Exception:

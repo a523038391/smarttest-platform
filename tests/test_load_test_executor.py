@@ -13,9 +13,13 @@ from services.api.load_test_repository import LoadTestRepository
 class Response:
     status_code = 200
 
+    def __init__(self, content: bytes = b"{}", status_code: int = 200) -> None:
+        self._content = content
+        self.status_code = status_code
+
     @property
-    def content(self):
-        raise AssertionError("load tests must not retain response bodies")
+    def content(self) -> bytes:
+        return self._content
 
     def close(self) -> None:
         pass
@@ -52,7 +56,7 @@ def definition(*, mode=LoadTestMode.COUNT, count=5, duration=1, concurrency=2,
     )
 
 
-def test_count_execution_is_bounded_and_does_not_read_bodies() -> None:
+def test_count_execution_is_bounded_and_samples_limited_bodies() -> None:
     calls = []
 
     def request(**kwargs):
@@ -67,8 +71,42 @@ def test_count_execution_is_bounded_and_does_not_read_bodies() -> None:
     assert metrics["successful_requests"] == 5
     assert metrics["status_counts"] == {"200": 5}
     assert metrics["target_metrics"]["health"]["total_requests"] == 5
+    assert len(metrics["response_samples"]["successful"]) == 5
     assert metrics["scenario_metrics"]["total_scenarios"] == 0
     assert all(call["allow_redirects"] is False and call["stream"] is True for call in calls)
+
+
+def test_response_samples_include_failures_and_redact_sensitive_json() -> None:
+    responses = [
+        Response(b'{"data":{"id":1},"accessToken":"secret-value"}'),
+        Response(b'{"message":"failed","password":"hidden"}', status_code=500),
+    ]
+
+    metrics = LoadTestExecutor(
+        request_callable=lambda **_: responses.pop(0),
+        resolver=lambda _: ["93.184.216.34"],
+    ).execute(definition(count=2, concurrency=1))
+
+    successful = metrics["response_samples"]["successful"][0]
+    failed = metrics["response_samples"]["failed"][0]
+    assert successful["status"] == 200
+    assert successful["body"]["data"] == {"id": 1}
+    assert successful["body"]["accessToken"] == "[REDACTED]"
+    assert failed["status"] == 500 and failed["error"] == "unexpected_status"
+    assert failed["body"]["message"] == "failed"
+    assert failed["body"]["password"] == "[REDACTED]"
+
+
+def test_response_samples_are_bounded_and_omit_unsafe_text() -> None:
+    metrics = LoadTestExecutor(
+        request_callable=lambda **_: Response(b"plain text response"),
+        resolver=lambda _: ["93.184.216.34"],
+    ).execute(definition(count=20, concurrency=1))
+
+    samples = metrics["response_samples"]["successful"]
+    assert len(samples) == 5
+    assert all(sample["body"] is None and sample["body_kind"] == "non_json"
+               for sample in samples)
 
 
 def test_duration_execution_observes_cancellation() -> None:
@@ -320,13 +358,16 @@ def test_login_runs_once_and_injects_extracted_token() -> None:
     def request(**kwargs):
         calls.append(kwargs)
         if kwargs["url"].endswith("/session"):
-            assert kwargs["json"] == {"username": account, "passcode": password}
+            assert kwargs["json"] == {
+                "tenantName": "demo", "username": account, "passcode": password,
+            }
             return LoginResponse(json.dumps({"data": {"access": token}}).encode())
         return Response()
 
     config = LoadTestAuthConfiguration(
         base_url="https://example.test/api", mode=LoadTestAuthMode.LOGIN,
         login_url="/session", account_field="username", password_field="passcode",
+        login_body={"tenantName": "demo", "username": "cannot-override"},
         token_path="data.access", account=account, password=password,
     )
     LoadTestExecutor(
@@ -339,6 +380,28 @@ def test_login_runs_once_and_injects_extracted_token() -> None:
     assert len(target_calls) == 3
     assert all(call["headers"]["Authorization"] == f"Bearer {token}"
                for call in target_calls)
+
+
+@pytest.mark.parametrize(("response", "code"), [
+    (LoginResponse(b"not-json"), "login_response_invalid"),
+    (LoginResponse(b'{"data":{}}'), "login_token_path_missing"),
+    (LoginResponse(b'{"data":{"token":123}}'), "login_token_invalid"),
+])
+def test_login_reports_safe_failure_category(response, code: str) -> None:
+    config = LoadTestAuthConfiguration(
+        base_url="https://example.test", mode=LoadTestAuthMode.LOGIN,
+        login_url="/session", account="account", password="password",
+    )
+
+    with pytest.raises(LoadTestExecutionError) as captured:
+        LoadTestExecutor(
+            request_callable=lambda **_: response,
+            resolver=lambda _: ["93.184.216.34"],
+        ).test_authentication(config)
+
+    assert captured.value.code == code
+    assert "account" not in str(captured.value)
+    assert "password" not in str(captured.value)
 
 
 def test_login_ssrf_failure_does_not_echo_credentials() -> None:
@@ -354,6 +417,43 @@ def test_login_ssrf_failure_does_not_echo_credentials() -> None:
         ).execute(definition(count=1), auth_config=config)
     assert account not in str(captured.value)
     assert password not in str(captured.value)
+
+
+def test_explicit_private_hostname_allowlist_remains_pinned_and_bounded() -> None:
+    calls = []
+    config = LoadTestAuthConfiguration(
+        base_url="http://erp.internal:8090", mode=LoadTestAuthMode.LOGIN,
+        login_url="/session", account="account", password="password",
+        token_path="result", auth_prefix="",
+    )
+
+    executor = LoadTestExecutor(
+        request_callable=lambda **kwargs: calls.append(kwargs)
+        or LoginResponse(b'{"result":"token"}'),
+        resolver=lambda _: ["192.168.7.44"],
+        allowed_private_hosts=("erp.internal",),
+    )
+
+    assert executor.test_authentication(config) is LoadTestAuthMode.LOGIN
+    assert len(calls) == 1
+    with pytest.raises(LoadTestExecutionError):
+        LoadTestExecutor(
+            request_callable=lambda **_: LoginResponse(b'{"result":"token"}'),
+            resolver=lambda _: ["192.168.7.44"],
+        ).test_authentication(config)
+
+
+@pytest.mark.parametrize("address", ["127.0.0.1", "169.254.1.1", "224.0.0.1"])
+def test_private_hostname_allowlist_never_allows_dangerous_addresses(address: str) -> None:
+    config = LoadTestAuthConfiguration(
+        base_url="http://erp.internal", mode=LoadTestAuthMode.LOGIN,
+        login_url="/session", account="account", password="password",
+    )
+    with pytest.raises(LoadTestExecutionError):
+        LoadTestExecutor(
+            request_callable=lambda **_: LoginResponse(b'{"data":{"token":"token"}}'),
+            resolver=lambda _: [address], allowed_private_hosts=("erp.internal",),
+        ).test_authentication(config)
 
 
 @pytest.mark.parametrize("headers", [

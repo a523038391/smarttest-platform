@@ -47,3 +47,9 @@ export interface EnvironmentUpdateInput extends Omit<EnvironmentCreateInput, 'pr
   status: EnvironmentStatus
   state_version: number
 }
+
+export interface EnvironmentAuthTestResult {
+  success: boolean
+  mode: 'DIRECT_TOKEN' | 'LOGIN'
+  message: string
+}

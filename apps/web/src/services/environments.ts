@@ -1,6 +1,6 @@
 import type {
   ConfigurationJson, ConfigurationValue, Environment, EnvironmentCreateInput,
-  EnvironmentStatus, EnvironmentUpdateInput,
+  EnvironmentAuthTestResult, EnvironmentStatus, EnvironmentUpdateInput,
 } from '../types/environment'
 
 type UnknownRecord = Record<string, unknown>
@@ -119,6 +119,26 @@ export async function createEnvironment(input: EnvironmentCreateInput): Promise<
 export async function updateEnvironment(id: string, input: EnvironmentUpdateInput): Promise<Environment> {
   return readEnvironment(await request(`/api/v1/environments/${encodeURIComponent(id)}`, { method: 'PUT',
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }), '保存环境')
+}
+
+export async function testEnvironmentAuthentication(id: string): Promise<EnvironmentAuthTestResult> {
+  const response = await request(
+    `/api/v1/environments/${encodeURIComponent(id)}/test-auth`, { method: 'POST' },
+  )
+  const payload: unknown = await response.json().catch(() => {
+    throw new Error('鉴权测试未返回有效 JSON')
+  })
+  if (!isRecord(payload) || !hasOnlyKeys(payload, ['success', 'mode', 'message'])
+    || typeof payload.success !== 'boolean'
+    || !['DIRECT_TOKEN', 'LOGIN'].includes(payload.mode as string)
+    || typeof payload.message !== 'string' || !payload.message) {
+    throw new Error('鉴权测试响应格式暂不支持')
+  }
+  return {
+    success: payload.success,
+    mode: payload.mode as EnvironmentAuthTestResult['mode'],
+    message: payload.message,
+  }
 }
 
 export function getEnvironmentErrorMessage(reason: unknown): string {

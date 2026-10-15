@@ -49,6 +49,7 @@ def test_settings_from_env_defaults_booleans_and_redacted_repr() -> None:
     assert defaults.auto_dispatch is False
     assert defaults.secret_capability_ttl_seconds == 60
     assert defaults.secret_staging_root is None
+    assert defaults.load_test_private_host_allowlist == ()
 
     settings = Settings.from_env(
         {
@@ -70,6 +71,17 @@ def test_settings_from_env_defaults_booleans_and_redacted_repr() -> None:
     assert settings.secret_capability_ttl_seconds == 45
     assert settings.runner_uid == 1234 and settings.runner_gid == 1235
     assert "credential-marker" not in repr(settings)
+
+
+def test_private_load_test_host_allowlist_is_normalized_and_validated() -> None:
+    settings = Settings.from_env({
+        "LOAD_TEST_PRIVATE_HOST_ALLOWLIST": " ERP.INTERNAL,api.internal ",
+    })
+    assert settings.load_test_private_host_allowlist == ("erp.internal", "api.internal")
+    with pytest.raises(ValueError, match="LOAD_TEST_PRIVATE_HOST_ALLOWLIST"):
+        Settings(load_test_private_host_allowlist=("http://erp.internal",))
+    with pytest.raises(ValueError, match="LOAD_TEST_PRIVATE_HOST_ALLOWLIST"):
+        Settings(load_test_private_host_allowlist=("localhost",))
 
 
 def test_create_app_selects_repository_and_disposes_sql_engine(monkeypatch) -> None:

@@ -79,6 +79,20 @@ export interface LoadTestMetricSummary {
 export interface LoadTestMetrics extends LoadTestMetricSummary {
   target_metrics: Record<string, LoadTestMetricSummary>
   scenario_metrics: LoadTestScenarioMetrics | null
+  response_samples: {
+    successful: LoadTestResponseSample[]
+    failed: LoadTestResponseSample[]
+  }
+}
+
+export interface LoadTestResponseSample {
+  target: string
+  status: number | null
+  latency_ms: number
+  error: string | null
+  body: JsonValue
+  body_kind: 'json' | 'empty' | 'non_json' | 'truncated' | 'unavailable'
+  truncated: boolean
 }
 
 export interface LoadTestScenarioMetrics {

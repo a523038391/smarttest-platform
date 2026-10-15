@@ -130,3 +130,9 @@ class EnvironmentResponse(ApiModel):
 class EnvironmentListResponse(ApiModel):
     items: list[EnvironmentResponse]
     total: int
+
+
+class EnvironmentAuthTestResponse(ApiModel):
+    success: bool
+    mode: Literal["DIRECT_TOKEN", "LOGIN"]
+    message: str
