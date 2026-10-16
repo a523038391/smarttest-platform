@@ -10,6 +10,8 @@ __pycache__/
 .sources/
 .runner-spool/
 .service-control/
+.runtime-temp/
+.platform-data/
 .mypy_cache/
 coverage/
 .coverage

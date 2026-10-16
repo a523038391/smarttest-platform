@@ -38,14 +38,25 @@ def test_sql_definition_and_run_round_trip(tmp_path) -> None:
         environment_id=environment.id,
         traffic_mode=LoadTestTrafficMode.SCENARIO,
         initial_variables={"seed": [1, 2]}, stop_on_failure=False,
+        category="Checkout",
     )
     assert definition.environment_id == environment.id
     assert definition.traffic_mode == LoadTestTrafficMode.SCENARIO
     assert definition.initial_variables == {"seed": [1, 2]}
     assert definition.stop_on_failure is False
+    assert definition.category == "Checkout"
     assert definition.targets[0]["think_time_ms"] == 25
     assert repository.get_load_test(definition.id) == definition
     run = repository.create_run(definition.id)
+    repository.add_run_responses(run.id, [{
+        "sequence": 1, "target": "API", "successful": True, "status": 200,
+        "latency_ms": 12.5, "error": None, "body": '{"ok":true}',
+        "body_kind": "json", "truncated": False, "body_bytes": 11,
+    }])
+    responses, response_total = repository.list_run_responses(
+        run.id, offset=0, limit=20, successful=True,
+    )
+    assert response_total == 1 and responses[0].body == '{"ok":true}'
     with pytest.raises(LoadTestActiveRunConflict):
         repository.create_run(definition.id)
     completed = repository.update_run(

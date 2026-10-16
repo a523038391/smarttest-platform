@@ -1,19 +1,25 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import {
-  cancelLoadTestRun, createLoadTest, deleteLoadTest, fetchLoadTestRuns, fetchLoadTests, getLoadTest,
-  getLoadTestRun, getLoadTestingErrorMessage, startLoadTestRun, updateLoadTest,
+  cancelLoadTestRun, createLoadTest, deleteLoadTest, fetchLoadTestResponses, fetchLoadTestRuns,
+  fetchLoadTests, getLoadTest, getLoadTestRun, getLoadTestingErrorMessage, startLoadTestRun,
+  updateLoadTest,
 } from '../services/load-testing'
 import { fetchEnvironments, getEnvironmentErrorMessage } from '../services/environments'
 import type { Environment } from '../types/environment'
 import type {
   HttpMethod, JsonObject, JsonValue, LoadTestCreateInput, LoadTestDefinition,
-  LoadTestMode, LoadTestResponseSample, LoadTestRun, LoadTestTarget, LoadTestTrafficMode,
+  LoadTestMode, LoadTestResponseDetail, LoadTestResponseResult, LoadTestRun,
+  LoadTestTarget, LoadTestTrafficMode,
 } from '../types/load-testing'
 
 const props = defineProps<{ projectId: string; projectsLoading: boolean; projectsError: string }>()
 const methods: HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 const statusLabels = { RUNNING: '运行中', SUCCEEDED: '已完成', FAILED: '失败' } as const
+const responseFilters: { key: LoadTestResponseResult; label: string }[] = [
+  { key: 'all', label: '全部' }, { key: 'successful', label: '成功' },
+  { key: 'failed', label: '失败' },
+]
 
 interface TargetDraft {
   key: string
@@ -33,6 +39,7 @@ interface DefinitionDraft {
   environmentId: string
   name: string
   description: string
+  category: string
   targets: TargetDraft[]
   trafficMode: LoadTestTrafficMode
   initialVariables: string
@@ -72,6 +79,13 @@ const environments = shallowRef<Environment[]>([])
 const draft = ref<DefinitionDraft | null>(null)
 const runs = shallowRef<LoadTestRun[]>([])
 const selectedRun = shallowRef<LoadTestRun | null>(null)
+const responseDetails = shallowRef<LoadTestResponseDetail[]>([])
+const responseTotal = ref(0)
+const responsePage = ref(1)
+const responseFilter = ref<LoadTestResponseResult>('all')
+const responsesLoading = ref(false)
+const responsesError = ref('')
+const responsePageSize = 20
 const loading = ref(false)
 const detailLoading = ref(false)
 const runsLoading = ref(false)
@@ -89,10 +103,26 @@ let environmentsController: AbortController | null = null
 let detailController: AbortController | null = null
 let runsController: AbortController | null = null
 let pollController: AbortController | null = null
+let responsesController: AbortController | null = null
 let pollTimer: number | null = null
 let disposed = false
 
 const metrics = computed(() => selectedRun.value?.metrics ?? null)
+const categoryOptions = computed(() => [...new Set(
+  definitions.value.map((item) => item.category).filter(Boolean),
+)].sort((left, right) => left.localeCompare(right, 'zh-CN')))
+const definitionGroups = computed(() => {
+  const groups = new Map<string, LoadTestDefinition[]>()
+  for (const item of definitions.value) {
+    const items = groups.get(item.category) ?? []
+    items.push(item)
+    groups.set(item.category, items)
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => left === '' ? 1 : right === '' ? -1 : left.localeCompare(right, 'zh-CN'))
+    .map(([category, items]) => ({ category, label: category || '未分类', items }))
+})
+const responsePageCount = computed(() => Math.max(1, Math.ceil(responseTotal.value / responsePageSize)))
 const successRate = computed(() => {
   const value = metrics.value
   return value && value.total_requests > 0
@@ -150,7 +180,8 @@ function blankTarget(index: number): TargetDraft {
 }
 
 function fromDefinition(item: LoadTestDefinition): DefinitionDraft {
-  return { id: item.id, environmentId: item.environment_id ?? '', name: item.name, description: item.description,
+  return { id: item.id, environmentId: item.environment_id ?? '', name: item.name,
+    description: item.description, category: item.category,
     targets: item.targets.map((target) => ({ key: crypto.randomUUID(), name: target.name,
       method: target.method, url: target.url,
       headers: Object.keys(target.headers).length ? JSON.stringify(target.headers, null, 2) : '',
@@ -165,12 +196,13 @@ function fromDefinition(item: LoadTestDefinition): DefinitionDraft {
 }
 
 function newDraft(source?: DefinitionDraft): DefinitionDraft {
-  if (!source) return { id: '', environmentId: '', name: '', description: '', targets: [blankTarget(1)],
+  if (!source) return { id: '', environmentId: '', name: '', description: '', category: '',
+    targets: [blankTarget(1)],
     trafficMode: 'REQUESTS', initialVariables: '{}', stopOnFailure: true, mode: 'COUNT',
     requestCount: 1, durationSeconds: 60, concurrency: 1, intervalMs: 0,
     timeoutSeconds: 30, stateVersion: 0 }
   return { id: '', environmentId: source.environmentId, name: `${source.name} 副本`,
-    description: source.description, trafficMode: source.trafficMode,
+    description: source.description, category: source.category, trafficMode: source.trafficMode,
     initialVariables: source.initialVariables, stopOnFailure: source.stopOnFailure,
     mode: source.mode, requestCount: source.requestCount, durationSeconds: source.durationSeconds,
     concurrency: source.concurrency, intervalMs: source.intervalMs,
@@ -214,12 +246,17 @@ function distributionRows(values: Record<string, number>, total: number): Distri
     .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
 }
 
-function responseBody(sample: LoadTestResponseSample): string {
-  if (sample.body_kind === 'json') return JSON.stringify(sample.body, null, 2)
-  if (sample.body_kind === 'empty') return '响应正文为空'
-  if (sample.body_kind === 'non_json') return '非 JSON 响应，出于安全考虑未展示正文'
-  if (sample.body_kind === 'truncated') return '响应正文超过 8 KB，未保存正文'
+function responseBody(item: LoadTestResponseDetail): string {
+  if (item.body !== null) return item.body
+  if (item.body_kind === 'empty') return '响应正文为空'
+  if (item.body_kind === 'binary') return '二进制响应未转换为文本展示'
   return '请求失败前未收到响应正文'
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${(value / 1024 / 1024).toFixed(2)} MB`
 }
 
 function parseJson(text: string, label: string): JsonValue {
@@ -305,7 +342,7 @@ function buildInput(): LoadTestCreateInput {
     throw new Error('超时时间必须大于 0 且不超过 120 秒。')
   }
   return { project_id: props.projectId, environment_id: value.environmentId || null,
-    name: value.name.trim(), description: value.description.trim(),
+    name: value.name.trim(), description: value.description.trim(), category: value.category.trim(),
     targets: value.targets.map((target, index) => parseTarget(
       target, index, Boolean(value.environmentId), value.trafficMode,
     )),
@@ -338,7 +375,11 @@ async function pollRunningRuns() {
     const updates = await Promise.all(ids.map((id) => getLoadTestRun(id, controller.signal)))
     for (const update of updates) {
       runs.value = runs.value.map((run) => run.id === update.id ? update : run)
-      if (selectedRun.value?.id === update.id) selectedRun.value = update
+      if (selectedRun.value?.id === update.id) {
+        const previousStatus = selectedRun.value.status
+        selectedRun.value = update
+        if (previousStatus === 'RUNNING' && update.status !== 'RUNNING') void loadResponses(1)
+      }
     }
   } catch (reason) {
     if (!(reason instanceof Error && reason.name === 'AbortError')) setFeedback(getLoadTestingErrorMessage(reason))
@@ -346,6 +387,39 @@ async function pollRunningRuns() {
     if (pollController === controller) pollController = null
     schedulePolling()
   }
+}
+
+async function loadResponses(page = responsePage.value) {
+  const runId = selectedRun.value?.id
+  if (!runId) return
+  responsesController?.abort()
+  const controller = new AbortController()
+  responsesController = controller
+  responsesLoading.value = true
+  responsesError.value = ''
+  const normalizedPage = Math.max(1, page)
+  try {
+    const result = await fetchLoadTestResponses(
+      runId, responseFilter.value, (normalizedPage - 1) * responsePageSize,
+      responsePageSize, controller.signal,
+    )
+    if (selectedRun.value?.id !== runId) return
+    responseDetails.value = result.items
+    responseTotal.value = result.total
+    responsePage.value = Math.min(normalizedPage, Math.max(1, Math.ceil(result.total / responsePageSize)))
+  } catch (reason) {
+    if (!(reason instanceof Error && reason.name === 'AbortError')) {
+      responsesError.value = getLoadTestingErrorMessage(reason)
+    }
+  } finally {
+    if (responsesController === controller) responsesLoading.value = false
+  }
+}
+
+function chooseResponseFilter(value: LoadTestResponseResult) {
+  if (responseFilter.value === value) return
+  responseFilter.value = value
+  void loadResponses(1)
 }
 
 async function loadRuns(id: string) {
@@ -476,7 +550,7 @@ async function persist(showMessage = true): Promise<LoadTestDefinition | null> {
   setFeedback()
   try {
     const updateInput = { environment_id: input.environment_id, name: input.name,
-      description: input.description, targets: input.targets,
+      description: input.description, category: input.category, targets: input.targets,
       traffic_mode: input.traffic_mode, initial_variables: input.initial_variables,
       stop_on_failure: input.stop_on_failure,
       mode: input.mode, request_count: input.request_count, duration_seconds: input.duration_seconds,
@@ -545,6 +619,15 @@ async function cancelRun() {
   finally { cancelling.value = false }
 }
 
+watch(() => selectedRun.value?.id, (runId) => {
+  responsesController?.abort()
+  responseDetails.value = []
+  responseTotal.value = 0
+  responsePage.value = 1
+  responsesError.value = ''
+  if (runId) void loadResponses(1)
+})
+
 watch(() => props.projectId, () => {
   detailController?.abort(); runsController?.abort(); environmentsController?.abort(); stopPolling(); draft.value = null
   runs.value = []; selectedRun.value = null
@@ -554,7 +637,7 @@ watch(() => props.projectId, () => {
 
 onBeforeUnmount(() => {
   disposed = true
-  listController?.abort(); detailController?.abort(); runsController?.abort(); environmentsController?.abort(); stopPolling()
+  listController?.abort(); detailController?.abort(); runsController?.abort(); environmentsController?.abort(); responsesController?.abort(); stopPolling()
 })
 </script>
 
@@ -576,15 +659,18 @@ onBeforeUnmount(() => {
       <div class="workspace">
         <aside class="definition-list">
           <div class="panel-title"><strong>压测配置</strong><span>{{ definitions.length }}</span></div>
-          <button v-for="item in definitions" :key="item.id" type="button" class="definition-item" :class="{ active: draft?.id === item.id }" @click="chooseDefinition(item)">
-            <strong>{{ item.name }}</strong><span>{{ item.traffic_mode === 'SCENARIO' ? '业务场景' : '独立接口' }} · {{ item.mode === 'COUNT' ? `按次数 · ${item.request_count === 1 ? '单次' : item.request_count + ' 次'}` : `按时间 · ${item.duration_seconds} 秒` }}</span><small>{{ item.targets.length }} 个{{ item.traffic_mode === 'SCENARIO' ? '步骤' : '目标' }} · {{ formatDate(item.updated_at) }}</small>
-          </button>
+          <details v-for="group in definitionGroups" :key="group.category" class="definition-group">
+            <summary><strong>{{ group.label }}</strong><span>{{ group.items.length }}</span></summary>
+            <button v-for="item in group.items" :key="item.id" type="button" class="definition-item" :class="{ active: draft?.id === item.id }" @click="chooseDefinition(item)">
+              <strong>{{ item.name }}</strong><span>{{ item.traffic_mode === 'SCENARIO' ? '业务场景' : '独立接口' }} · {{ item.mode === 'COUNT' ? `按次数 · ${item.request_count === 1 ? '单次' : item.request_count + ' 次'}` : `按时间 · ${item.duration_seconds} 秒` }}</span><small>{{ item.targets.length }} 个{{ item.traffic_mode === 'SCENARIO' ? '步骤' : '目标' }} · {{ formatDate(item.updated_at) }}</small>
+            </button>
+          </details>
           <div v-if="!definitions.length" class="empty-small">暂无压测配置<br>点击“新建压测”开始</div>
         </aside>
 
         <div v-if="draft" class="editor" @input="markDirty" @change="markDirty">
           <div class="editor-toolbar">
-            <div class="title-fields"><input v-model="draft.name" maxlength="255" placeholder="压测名称" aria-label="压测名称"><input v-model="draft.description" maxlength="100000" placeholder="添加描述" aria-label="压测描述"></div>
+            <div class="title-fields"><input v-model="draft.name" maxlength="255" placeholder="压测名称" aria-label="压测名称"><input v-model="draft.description" maxlength="100000" placeholder="添加描述" aria-label="压测描述"><input v-model="draft.category" list="load-test-categories" maxlength="100" placeholder="选择或输入分类（可选）" aria-label="压测分类"><datalist id="load-test-categories"><option v-for="category in categoryOptions" :key="category" :value="category"></option></datalist></div>
             <div class="toolbar-actions"><span v-if="detailLoading">同步中…</span><span v-else-if="dirty" class="dirty">未保存</span><button class="secondary" type="button" @click="copyDraft">复制</button><button v-if="draft.id" class="secondary danger" type="button" :disabled="deleting" @click="removeDefinition">{{ deleting ? '删除中…' : '删除' }}</button><button class="secondary" type="button" :disabled="saving" @click="persist()">{{ saving ? '保存中…' : '保存' }}</button><button class="primary" type="button" :disabled="starting || saving" @click="startRun">{{ starting ? '启动中…' : '▶ 开始压测' }}</button></div>
           </div>
 
@@ -618,10 +704,22 @@ onBeforeUnmount(() => {
 
           <section class="targets-section">
             <header><div><h3>{{ draft.trafficMode === 'SCENARIO' ? '场景步骤' : '接口目标' }}</h3><p>{{ draft.trafficMode === 'SCENARIO' ? '每个虚拟用户按顺序执行以下步骤，最多 20 个。' : '并发请求以下独立目标，最多可配置 20 个。' }}</p></div><button class="secondary" type="button" :disabled="draft.targets.length >= 20" @click="addTarget">+ 添加{{ draft.trafficMode === 'SCENARIO' ? '步骤' : '目标' }}</button></header>
+            <details class="dynamic-help" open>
+              <summary>动态参数与随机数据 <small>每次请求自动生成</small></summary>
+              <p>可用于 URL、请求头、查询参数和请求体。同一请求内，相同表达式会复用同一个值。</p>
+              <div class="dynamic-token-list">
+                <div><code v-pre>{{$uuid}}</code><span>UUID 唯一标识</span></div><div><code v-pre>{{$sequence}}</code><span>从 1 开始的请求序号</span></div><div><code v-pre>{{$timestamp}}</code><span>秒级时间戳</span></div><div><code v-pre>{{$timestampMs}}</code><span>毫秒级时间戳</span></div><div><code v-pre>{{$randomInt(1,100)}}</code><span>指定范围随机整数</span></div><div><code v-pre>{{$randomString(8)}}</code><span>随机字母与数字</span></div><div><code v-pre>{{$randomDigits(6)}}</code><span>指定位数随机数字</span></div><div><code v-pre>{{$randomBoolean}}</code><span>随机 true / false</span></div><div><code v-pre>{{$randomPhone}}</code><span>随机手机号</span></div><div><code v-pre>{{$randomEmail}}</code><span>随机邮箱</span></div><div><code v-pre>{{$randomChoice(draft,paid,closed)}}</code><span>从候选值中随机选择</span></div>
+              </div>
+              <div class="dynamic-example"><span>请求体示例</span><pre v-pre>{
+  "page": "{{$randomInt(1,10)}}",
+  "requestId": "{{$uuid}}",
+  "mobile": "{{$randomPhone}}"
+}</pre><small>值完全由一个表达式组成时，会保留数字或布尔类型；与其他文字拼接时生成字符串。</small></div>
+            </details>
             <article v-for="(target, index) in draft.targets" :key="target.key" class="target-card">
               <header><span>{{ index + 1 }}</span><input v-model="target.name" maxlength="255" aria-label="目标名称" placeholder="接口名称"><button v-if="draft.trafficMode === 'SCENARIO'" type="button" :disabled="index === 0" @click="moveTarget(index, -1)">上移</button><button v-if="draft.trafficMode === 'SCENARIO'" type="button" :disabled="index === draft.targets.length - 1" @click="moveTarget(index, 1)">下移</button><button type="button" :disabled="draft.targets.length === 1" @click="removeTarget(index)">删除</button></header>
               <div class="request-line"><select v-model="target.method" aria-label="请求方法"><option v-for="method in methods" :key="method">{{ method }}</option></select><input v-model="target.url" :type="draft.environmentId ? 'text' : 'url'" :placeholder="draft.environmentId ? '/api/resource' : 'https://api.example.com/resource'" aria-label="请求 URL"></div>
-              <div class="json-grid"><label><span>附加请求头（可选）</span><textarea v-model="target.headers" rows="4" spellcheck="false" placeholder="留空即可；环境鉴权会自动注入 Authorization"></textarea><small>仅填写接口额外需要的请求头。</small></label><label><span>查询参数 JSON</span><textarea v-model="target.query" rows="4" spellcheck="false"></textarea></label><label><span>请求体 JSON</span><textarea v-model="target.body" rows="4" spellcheck="false"></textarea></label><label><span>期望状态码</span><input v-model="target.expectedStatuses" placeholder="200, 201"><small>多个状态码用逗号分隔</small></label></div>
+              <div class="json-grid"><label><span>附加请求头（可选）</span><textarea v-model="target.headers" rows="4" spellcheck="false" placeholder="留空即可；环境鉴权会自动注入 Authorization"></textarea><small>仅填写接口额外需要的请求头，支持动态参数。</small></label><label><span>查询参数 JSON</span><textarea v-model="target.query" rows="4" spellcheck="false"></textarea><small>支持动态参数，每次请求独立生成。</small></label><label><span>请求体 JSON</span><textarea v-model="target.body" rows="4" spellcheck="false"></textarea><small>在 JSON 字符串值中填写动态表达式。</small></label><label><span>期望状态码</span><input v-model="target.expectedStatuses" placeholder="200, 201"><small>多个状态码用逗号分隔</small></label></div>
               <div v-if="draft.trafficMode === 'SCENARIO'" class="scenario-step-grid">
                 <label><span>步骤等待（毫秒）</span><input v-model.number="target.thinkTimeMs" type="number" min="0" max="60000"><small>完成本步骤后再等待指定时间。</small></label>
                 <label><span>响应提取 JSON</span><textarea v-model="target.extractors" rows="4" spellcheck="false" placeholder='{"orderId":"data.id"}'></textarea><small>值为响应 JSON 路径；后续可在 URL、Header、Query、Body 中使用 <code v-pre>{{orderId}}</code>。</small></label>
@@ -646,9 +744,17 @@ onBeforeUnmount(() => {
                   </template>
                   <div class="counts-grid"><div><h4>状态码分布</h4><p v-if="!statusDistribution.length">暂无</p><div v-for="row in statusDistribution" :key="row.name" class="distribution-row"><code>HTTP {{ row.name }}</code><span><i :style="{ width: `${row.percentage}%` }"></i></span><strong>{{ row.count }}</strong><small>{{ row.percentage.toFixed(1) }}%</small></div></div><div class="error-distribution"><h4>错误分布</h4><p v-if="!errorDistribution.length">暂无</p><div v-for="row in errorDistribution" :key="row.name" class="distribution-row"><code>{{ row.name }}</code><span><i :style="{ width: `${row.percentage}%` }"></i></span><strong>{{ row.count }}</strong><small>{{ row.percentage.toFixed(1) }}%</small></div></div></div>
                   <div v-if="targetMetricRows.length" class="target-table-wrap"><h4>目标明细</h4><table><thead><tr><th>目标</th><th>请求</th><th>成功</th><th>失败</th><th>成功率</th><th>RPS</th><th>平均</th><th>Min</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th></tr></thead><tbody><tr v-for="row in targetMetricRows" :key="row.name"><td>{{ row.name }}</td><td>{{ row.total ?? '—' }}</td><td>{{ row.successful ?? '—' }}</td><td>{{ row.failed ?? '—' }}</td><td>{{ row.successRate }}</td><td>{{ formatNumber(row.rps, 2) }}</td><td>{{ formatNumber(row.average) }}</td><td>{{ formatNumber(row.min) }}</td><td>{{ formatNumber(row.p50) }}</td><td>{{ formatNumber(row.p95) }}</td><td>{{ formatNumber(row.p99) }}</td><td>{{ formatNumber(row.max) }}</td></tr></tbody></table><small class="table-unit">响应时间单位：ms</small></div>
-                  <div v-if="metrics.response_samples.successful.length || metrics.response_samples.failed.length" class="response-samples">
-                    <section><h4>成功返回样本 <span>{{ metrics.response_samples.successful.length }}</span></h4><p v-if="!metrics.response_samples.successful.length">暂无</p><details v-for="(sample, index) in metrics.response_samples.successful" :key="`success-${sample.target}-${index}`"><summary><strong>{{ sample.target }}</strong><span>HTTP {{ sample.status ?? '—' }} · {{ sample.latency_ms.toFixed(1) }} ms</span></summary><pre>{{ responseBody(sample) }}</pre></details></section>
-                    <section class="failed-samples"><h4>失败返回样本 <span>{{ metrics.response_samples.failed.length }}</span></h4><p v-if="!metrics.response_samples.failed.length">暂无</p><details v-for="(sample, index) in metrics.response_samples.failed" :key="`failed-${sample.target}-${index}`"><summary><strong>{{ sample.target }}</strong><span>HTTP {{ sample.status ?? '—' }} · {{ sample.latency_ms.toFixed(1) }} ms · {{ sample.error ?? '未知错误' }}</span></summary><pre>{{ responseBody(sample) }}</pre></details></section>
+                  <div class="response-details">
+                    <header><div><h4>实际响应明细 <span>{{ responseTotal }}</span></h4><small>每次请求均单独保存，分页查看全部返回</small></div><button type="button" :disabled="responsesLoading" @click="loadResponses()">{{ responsesLoading ? '加载中…' : '刷新' }}</button></header>
+                    <div class="response-filters"><button v-for="item in responseFilters" :key="item.key" type="button" :class="{ active: responseFilter === item.key }" @click="chooseResponseFilter(item.key)">{{ item.label }}</button></div>
+                    <p v-if="responsesError" class="response-error">{{ responsesError }}</p>
+                    <p v-else-if="!responsesLoading && !responseDetails.length" class="response-empty">暂无响应明细；旧运行记录不会补生成明细。</p>
+                    <details v-for="item in responseDetails" :key="item.id" :class="{ failed: !item.successful }">
+                      <summary><strong>#{{ item.sequence }} · {{ item.target }}</strong><span>{{ item.successful ? '成功' : '失败' }} · HTTP {{ item.status ?? '—' }} · {{ item.latency_ms.toFixed(1) }} ms · {{ formatBytes(item.body_bytes) }}</span></summary>
+                      <div v-if="item.error || item.truncated" class="response-warning"><span v-if="item.error">错误：{{ item.error }}</span><span v-if="item.truncated">正文超过 1 MiB，已展示保存的前 1 MiB</span></div>
+                      <pre>{{ responseBody(item) }}</pre>
+                    </details>
+                    <footer v-if="responseTotal > responsePageSize"><span>第 {{ responsePage }} / {{ responsePageCount }} 页</span><div><button type="button" :disabled="responsesLoading || responsePage <= 1" @click="loadResponses(responsePage - 1)">上一页</button><button type="button" :disabled="responsesLoading || responsePage >= responsePageCount" @click="loadResponses(responsePage + 1)">下一页</button></div></footer>
                   </div>
                 </div>
                 <div v-else class="result-empty">{{ selectedRun?.status === 'RUNNING' ? '压测运行中，指标将自动刷新…' : selectedRun ? '本次运行暂无指标' : '选择运行记录查看指标' }}</div>
@@ -663,11 +769,13 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.load-testing{display:flex;flex-direction:column;gap:16px}.page-header{display:flex;align-items:center;justify-content:space-between;gap:16px}.page-header h2{margin:0;color:#1c273a;font-size:20px}.page-header p,.targets-section>header p{margin:6px 0 0;color:#8994a7;font-size:12px}.primary,.secondary{border-radius:8px;font-weight:700;cursor:pointer}.primary{height:40px;padding:0 17px;border:0;color:#fff;background:linear-gradient(100deg,#456fd6,#6b60dc)}.secondary{height:34px;padding:0 12px;border:1px solid #dfe5ee;color:#556176;background:#fff}.primary:disabled,.secondary:disabled{cursor:not-allowed;opacity:.55}.secondary.danger{color:#bd4654}.state{min-height:260px;padding:28px;border:1px solid #e5eaf2;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;background:#fff}.state p{max-width:440px;margin:0;color:#8994a7;font-size:12px}.error-state{border-color:#ffd7db}.loader{width:20px;height:20px;border:3px solid #dbe4f5;border-top-color:#4f72ca;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.notice{margin:0;padding:10px 12px;border-radius:8px;font-size:12px}.notice-error{border:1px solid #ffd7db;color:#b84350;background:#fff5f6}.notice-success{border:1px solid #ccebd8;color:#287a49;background:#f2fbf5}.workspace{min-height:600px;display:grid;grid-template-columns:220px minmax(0,1fr);border:1px solid #e3e8f0;border-radius:14px;overflow:hidden;background:#fff}.definition-list{padding:14px;border-right:1px solid #e8edf4;background:#f8fafc}.panel-title{min-height:26px;display:flex;align-items:center;justify-content:space-between;color:#344158;font-size:12px}.panel-title span{color:#8994a7;font-size:10px}.definition-item{width:100%;display:grid;gap:4px;margin-top:7px;padding:11px;border:1px solid transparent;border-radius:9px;text-align:left;background:transparent;cursor:pointer}.definition-item:hover{background:#fff}.definition-item.active{border-color:#cfdbf8;background:#fff;box-shadow:0 3px 10px rgba(54,79,136,.08)}.definition-item strong{overflow:hidden;color:#344158;font-size:12px;text-overflow:ellipsis;white-space:nowrap}.definition-item span{color:#5c76bb;font-size:9px}.definition-item small{color:#929daf;font-size:9px}.empty-small,.editor-empty{color:#9aa4b4;text-align:center;font-size:10px;line-height:1.7}.empty-small{margin-top:18px}.editor{min-width:0;background:#f7f9fc}.editor-toolbar{min-height:70px;padding:11px 15px;border-bottom:1px solid #e8edf4;display:flex;align-items:center;justify-content:space-between;gap:12px;background:#fff}.title-fields{min-width:180px;display:grid;gap:4px}.title-fields input{padding:3px 5px;border:1px solid transparent;border-radius:5px;background:transparent}.title-fields input:first-child{color:#243149;font-size:15px;font-weight:750}.title-fields input:last-child{color:#8792a5;font-size:10px}.title-fields input:focus{border-color:#b8c9ef;outline:0}.toolbar-actions{display:flex;align-items:center;gap:7px}.toolbar-actions>span,.dirty{color:#8994a7;font-size:10px;white-space:nowrap}.toolbar-actions .dirty{color:#b47a24}.environment-card,.settings-card,.targets-section,.results-section{margin:14px;border:1px solid #e3e8f0;border-radius:11px;background:#fff}.environment-card,.settings-card,.targets-section{padding:15px}.environment-card label{display:grid;gap:6px;color:#5f6c81;font-size:10px}.environment-card select{height:38px;padding:0 10px;border:1px solid #dfe5ee;border-radius:7px;color:#29364a;background:#fbfcfe;font:500 11px inherit}.environment-card>small{display:block;margin-top:6px;color:#8994a7;font-size:9px}.environment-card>small.environment-error{color:#b84350}.environment-card p{margin:10px 0 0;padding:8px 10px;border-radius:7px;color:#456cbf;background:#f1f5ff;font-size:10px}.settings-card h3,.targets-section h3,.results-section h3{margin:0;color:#344158;font-size:13px}.mode-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}.mode-card{padding:12px;border:1px solid #e0e6ef;border-radius:9px;display:flex;align-items:flex-start;gap:9px;cursor:pointer}.mode-card.active{border-color:#7392df;background:#f5f8ff;box-shadow:0 0 0 2px #e9efff}.mode-card input{margin-top:3px}.mode-card span{display:grid;gap:3px}.mode-card strong{color:#354158;font-size:11px}.mode-card small{color:#8e99ab;font-size:9px}.number-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:13px}.number-grid label,.json-grid label{display:grid;align-content:start;gap:5px;color:#5f6c81;font-size:10px}.number-grid input,.json-grid input,.request-line input,.request-line select,.target-card>header input{height:35px;padding:0 9px;border:1px solid #dfe5ee;border-radius:7px;color:#29364a;background:#fbfcfe;font:500 11px inherit}.number-grid small,.json-grid small{color:#929daf;font-size:9px}.targets-section>header,.results-section>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.target-card{margin-top:13px;border:1px solid #e1e7ef;border-radius:10px;overflow:hidden}.target-card>header{padding:9px 11px;border-bottom:1px solid #edf0f5;display:flex;align-items:center;gap:8px;background:#fafbfd}.target-card>header>span{width:23px;height:23px;border-radius:6px;display:grid;place-items:center;color:#fff;background:#5d7bd1;font-size:10px;font-weight:800}.target-card>header input{flex:1;border-color:transparent;background:transparent;font-weight:700}.target-card>header button{border:0;color:#bd4654;background:transparent;font-size:10px;font-weight:700;cursor:pointer}.target-card>header button:disabled{color:#b9c0cc;cursor:not-allowed}.request-line{padding:11px;display:grid;grid-template-columns:110px minmax(0,1fr);gap:8px}.request-line select{font-weight:750}.json-grid{padding:0 11px 12px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.json-grid textarea{width:100%;padding:8px;border:1px solid #dfe5ee;border-radius:7px;resize:vertical;color:#29364a;background:#fbfcfe;font:10px/1.45 Consolas,"Microsoft YaHei",monospace}.number-grid input:focus,.json-grid input:focus,.json-grid textarea:focus,.request-line input:focus,.request-line select:focus{border-color:#6b8de2;outline:0}.results-section{overflow:hidden}.results-section>header{padding:13px 15px}.results-section>header>div{display:flex;align-items:center;gap:8px}.results-section>header span{color:#8f9aac;font-size:9px}.results-section>header button{border:0;color:#5071c7;background:transparent;font-size:10px;font-weight:700;cursor:pointer}.history-layout{min-height:300px;display:grid;grid-template-columns:210px minmax(0,1fr);border-top:1px solid #edf0f5}.history-list{max-height:460px;padding:9px;overflow:auto;border-right:1px solid #edf0f5;background:#fafbfd}.history-list button{width:100%;padding:9px 8px;border:1px solid transparent;border-radius:7px;display:grid;grid-template-columns:1fr 1fr;gap:5px;text-align:left;background:transparent;cursor:pointer}.history-list button.active{border-color:#d8e2f8;background:#fff}.history-list button>span:nth-child(2){color:#7d899d;text-align:right;font-size:9px}.history-list small{grid-column:1/-1;color:#929daf;font-size:9px}.history-list p{color:#929daf;text-align:center;font-size:9px}.status{font-size:9px;font-weight:800}.status.running{color:#4d70ca}.status.succeeded{color:#278555}.status.failed{color:#bf4654}.metrics-area{min-width:0;padding:14px}.run-summary>div{display:flex;justify-content:space-between;gap:12px;color:#344158;font-size:11px}.run-summary span{color:#929daf;font-size:9px}.run-error{padding:8px;border-radius:6px;color:#b84350;background:#fff4f5;font-size:10px}.metric-cards{display:grid;grid-template-columns:repeat(3,minmax(100px,1fr));gap:9px;margin-top:12px}.metric-cards>div{padding:11px;border:1px solid #e7ebf2;border-radius:8px;display:grid;gap:5px;background:#fafbfd}.metric-cards span{color:#8490a3;font-size:9px}.metric-cards strong{color:#2d3b53;font-size:17px}.metric-cards small{font-size:8px}.latency-row{margin-top:10px;padding:10px;border-radius:8px;display:flex;justify-content:space-around;gap:8px;flex-wrap:wrap;background:#f4f7fb}.latency-row span{color:#8490a3;font-size:9px}.latency-row strong{margin-left:4px;color:#43516a}.counts-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.counts-grid>div{padding:10px;border:1px solid #e7ebf2;border-radius:8px;display:flex;align-content:flex-start;gap:6px;flex-wrap:wrap}.counts-grid h4,.target-table-wrap h4{width:100%;margin:0 0 4px;color:#566278;font-size:10px}.counts-grid span{padding:4px 7px;border-radius:5px;color:#647188;background:#f5f7fa;font-size:9px}.counts-grid code{margin-right:6px;color:#41516c;font-weight:700}.counts-grid p{margin:0;color:#9aa4b4;font-size:9px}.target-table-wrap{margin-top:10px;overflow:auto}.target-table-wrap table{width:100%;border-collapse:collapse;color:#5e6b80;font-size:9px}.target-table-wrap th,.target-table-wrap td{padding:7px;border-bottom:1px solid #edf0f5;text-align:right;white-space:nowrap}.target-table-wrap th:first-child,.target-table-wrap td:first-child{text-align:left}.result-empty,.editor-empty{min-height:250px;display:flex;flex-direction:column;align-items:center;justify-content:center}.editor-empty p{margin:4px 0 12px}.editor-empty strong{color:#637086;font-size:13px}
+.load-testing{display:flex;flex-direction:column;gap:16px}.page-header{display:flex;align-items:center;justify-content:space-between;gap:16px}.page-header h2{margin:0;color:#1c273a;font-size:20px}.page-header p,.targets-section>header p{margin:6px 0 0;color:#8994a7;font-size:12px}.primary,.secondary{border-radius:8px;font-weight:700;cursor:pointer}.primary{height:40px;padding:0 17px;border:0;color:#fff;background:linear-gradient(100deg,#456fd6,#6b60dc)}.secondary{height:34px;padding:0 12px;border:1px solid #dfe5ee;color:#556176;background:#fff}.primary:disabled,.secondary:disabled{cursor:not-allowed;opacity:.55}.secondary.danger{color:#bd4654}.state{min-height:260px;padding:28px;border:1px solid #e5eaf2;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;background:#fff}.state p{max-width:440px;margin:0;color:#8994a7;font-size:12px}.error-state{border-color:#ffd7db}.loader{width:20px;height:20px;border:3px solid #dbe4f5;border-top-color:#4f72ca;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.notice{margin:0;padding:10px 12px;border-radius:8px;font-size:12px}.notice-error{border:1px solid #ffd7db;color:#b84350;background:#fff5f6}.notice-success{border:1px solid #ccebd8;color:#287a49;background:#f2fbf5}.workspace{min-height:600px;display:grid;grid-template-columns:220px minmax(0,1fr);border:1px solid #e3e8f0;border-radius:14px;overflow:hidden;background:#fff}.definition-list{padding:14px;border-right:1px solid #e8edf4;background:#f8fafc}.panel-title{min-height:26px;display:flex;align-items:center;justify-content:space-between;color:#344158;font-size:12px}.panel-title span{color:#8994a7;font-size:10px}.definition-group{margin-top:10px}.definition-group>summary{padding:4px 5px;display:flex;align-items:center;gap:6px;color:#718099;font-size:9px;cursor:pointer;list-style:none}.definition-group>summary::-webkit-details-marker{display:none}.definition-group>summary::before{content:'›';color:#8491a7;font-size:14px;line-height:1;transition:transform .15s ease}.definition-group[open]>summary::before{transform:rotate(90deg)}.definition-group>summary strong{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.definition-group>summary span{color:#a0aaba}.definition-item{width:100%;display:grid;gap:4px;margin-top:5px;padding:11px;border:1px solid transparent;border-radius:9px;text-align:left;background:transparent;cursor:pointer}.definition-item:hover{background:#fff}.definition-item.active{border-color:#cfdbf8;background:#fff;box-shadow:0 3px 10px rgba(54,79,136,.08)}.definition-item strong{overflow:hidden;color:#344158;font-size:12px;text-overflow:ellipsis;white-space:nowrap}.definition-item span{color:#5c76bb;font-size:9px}.definition-item small{color:#929daf;font-size:9px}.empty-small,.editor-empty{color:#9aa4b4;text-align:center;font-size:10px;line-height:1.7}.empty-small{margin-top:18px}.editor{min-width:0;background:#f7f9fc}.editor-toolbar{min-height:70px;padding:11px 15px;border-bottom:1px solid #e8edf4;display:flex;align-items:center;justify-content:space-between;gap:12px;background:#fff}.title-fields{min-width:210px;display:grid;gap:4px}.title-fields input{padding:3px 5px;border:1px solid transparent;border-radius:5px;background:transparent}.title-fields input:first-child{color:#243149;font-size:15px;font-weight:750}.title-fields input:nth-child(n+2){color:#8792a5;font-size:10px}.title-fields input:focus{border-color:#b8c9ef;outline:0}.toolbar-actions{display:flex;align-items:center;gap:7px}.toolbar-actions>span,.dirty{color:#8994a7;font-size:10px;white-space:nowrap}.toolbar-actions .dirty{color:#b47a24}.environment-card,.settings-card,.targets-section,.results-section{margin:14px;border:1px solid #e3e8f0;border-radius:11px;background:#fff}.environment-card,.settings-card,.targets-section{padding:15px}.environment-card label{display:grid;gap:6px;color:#5f6c81;font-size:10px}.environment-card select{height:38px;padding:0 10px;border:1px solid #dfe5ee;border-radius:7px;color:#29364a;background:#fbfcfe;font:500 11px inherit}.environment-card>small{display:block;margin-top:6px;color:#8994a7;font-size:9px}.environment-card>small.environment-error{color:#b84350}.environment-card p{margin:10px 0 0;padding:8px 10px;border-radius:7px;color:#456cbf;background:#f1f5ff;font-size:10px}.settings-card h3,.targets-section h3,.results-section h3{margin:0;color:#344158;font-size:13px}.mode-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}.mode-card{padding:12px;border:1px solid #e0e6ef;border-radius:9px;display:flex;align-items:flex-start;gap:9px;cursor:pointer}.mode-card.active{border-color:#7392df;background:#f5f8ff;box-shadow:0 0 0 2px #e9efff}.mode-card input{margin-top:3px}.mode-card span{display:grid;gap:3px}.mode-card strong{color:#354158;font-size:11px}.mode-card small{color:#8e99ab;font-size:9px}.number-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:13px}.number-grid label,.json-grid label{display:grid;align-content:start;gap:5px;color:#5f6c81;font-size:10px}.number-grid input,.json-grid input,.request-line input,.request-line select,.target-card>header input{height:35px;padding:0 9px;border:1px solid #dfe5ee;border-radius:7px;color:#29364a;background:#fbfcfe;font:500 11px inherit}.number-grid small,.json-grid small{color:#929daf;font-size:9px}.targets-section>header,.results-section>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.target-card{margin-top:13px;border:1px solid #e1e7ef;border-radius:10px;overflow:hidden}.target-card>header{padding:9px 11px;border-bottom:1px solid #edf0f5;display:flex;align-items:center;gap:8px;background:#fafbfd}.target-card>header>span{width:23px;height:23px;border-radius:6px;display:grid;place-items:center;color:#fff;background:#5d7bd1;font-size:10px;font-weight:800}.target-card>header input{flex:1;border-color:transparent;background:transparent;font-weight:700}.target-card>header button{border:0;color:#bd4654;background:transparent;font-size:10px;font-weight:700;cursor:pointer}.target-card>header button:disabled{color:#b9c0cc;cursor:not-allowed}.request-line{padding:11px;display:grid;grid-template-columns:110px minmax(0,1fr);gap:8px}.request-line select{font-weight:750}.json-grid{padding:0 11px 12px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.json-grid textarea{width:100%;padding:8px;border:1px solid #dfe5ee;border-radius:7px;resize:vertical;color:#29364a;background:#fbfcfe;font:10px/1.45 Consolas,"Microsoft YaHei",monospace}.number-grid input:focus,.json-grid input:focus,.json-grid textarea:focus,.request-line input:focus,.request-line select:focus{border-color:#6b8de2;outline:0}.results-section{overflow:hidden}.results-section>header{padding:13px 15px}.results-section>header>div{display:flex;align-items:center;gap:8px}.results-section>header span{color:#8f9aac;font-size:9px}.results-section>header button{border:0;color:#5071c7;background:transparent;font-size:10px;font-weight:700;cursor:pointer}.history-layout{min-height:300px;display:grid;grid-template-columns:210px minmax(0,1fr);border-top:1px solid #edf0f5}.history-list{max-height:460px;padding:9px;overflow:auto;border-right:1px solid #edf0f5;background:#fafbfd}.history-list button{width:100%;padding:9px 8px;border:1px solid transparent;border-radius:7px;display:grid;grid-template-columns:1fr 1fr;gap:5px;text-align:left;background:transparent;cursor:pointer}.history-list button.active{border-color:#d8e2f8;background:#fff}.history-list button>span:nth-child(2){color:#7d899d;text-align:right;font-size:9px}.history-list small{grid-column:1/-1;color:#929daf;font-size:9px}.history-list p{color:#929daf;text-align:center;font-size:9px}.status{font-size:9px;font-weight:800}.status.running{color:#4d70ca}.status.succeeded{color:#278555}.status.failed{color:#bf4654}.metrics-area{min-width:0;padding:14px}.run-summary>div{display:flex;justify-content:space-between;gap:12px;color:#344158;font-size:11px}.run-summary span{color:#929daf;font-size:9px}.run-error{padding:8px;border-radius:6px;color:#b84350;background:#fff4f5;font-size:10px}.metric-cards{display:grid;grid-template-columns:repeat(3,minmax(100px,1fr));gap:9px;margin-top:12px}.metric-cards>div{padding:11px;border:1px solid #e7ebf2;border-radius:8px;display:grid;gap:5px;background:#fafbfd}.metric-cards span{color:#8490a3;font-size:9px}.metric-cards strong{color:#2d3b53;font-size:17px}.metric-cards small{font-size:8px}.latency-row{margin-top:10px;padding:10px;border-radius:8px;display:flex;justify-content:space-around;gap:8px;flex-wrap:wrap;background:#f4f7fb}.latency-row span{color:#8490a3;font-size:9px}.latency-row strong{margin-left:4px;color:#43516a}.counts-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.counts-grid>div{padding:10px;border:1px solid #e7ebf2;border-radius:8px;display:flex;align-content:flex-start;gap:6px;flex-wrap:wrap}.counts-grid h4,.target-table-wrap h4{width:100%;margin:0 0 4px;color:#566278;font-size:10px}.counts-grid span{padding:4px 7px;border-radius:5px;color:#647188;background:#f5f7fa;font-size:9px}.counts-grid code{margin-right:6px;color:#41516c;font-weight:700}.counts-grid p{margin:0;color:#9aa4b4;font-size:9px}.target-table-wrap{margin-top:10px;overflow:auto}.target-table-wrap table{width:100%;border-collapse:collapse;color:#5e6b80;font-size:9px}.target-table-wrap th,.target-table-wrap td{padding:7px;border-bottom:1px solid #edf0f5;text-align:right;white-space:nowrap}.target-table-wrap th:first-child,.target-table-wrap td:first-child{text-align:left}.result-empty,.editor-empty{min-height:250px;display:flex;flex-direction:column;align-items:center;justify-content:center}.editor-empty p{margin:4px 0 12px}.editor-empty strong{color:#637086;font-size:13px}
+.definition-group{margin-top:12px}.definition-group>summary{min-height:40px;padding:0 10px;border:1px solid #e0e6ef;border-radius:8px;color:#43516a;background:#fff;font-size:13px;font-weight:700;box-sizing:border-box}.definition-group>summary:hover{border-color:#cbd8f5;background:#f8faff}.definition-group[open]>summary{border-color:#b9caf1;background:#f2f6ff}.definition-group>summary::before{width:14px;color:#5874bb;font-size:20px}.definition-group>summary span{min-width:24px;height:22px;border-radius:12px;display:grid;place-items:center;color:#60708a;background:#eaf0fb;font-size:11px;font-weight:700}
 .traffic-mode-row+.mode-row{margin-top:10px}.scenario-options{margin-top:13px;padding:12px;border-radius:9px;display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,1fr);gap:14px;background:#f7f9fd}.scenario-options>label,.scenario-step-grid label{display:grid;align-content:start;gap:5px;color:#5f6c81;font-size:10px}.scenario-options textarea,.scenario-step-grid textarea{width:100%;box-sizing:border-box;padding:8px;border:1px solid #dfe5ee;border-radius:7px;resize:vertical;color:#29364a;background:#fff;font:10px/1.45 Consolas,"Microsoft YaHei",monospace}.scenario-options small,.scenario-step-grid small{color:#929daf;font-size:9px}.scenario-options .switch-field{display:flex;align-items:flex-start;padding:10px;border:1px solid #e3e8f0;border-radius:8px;background:#fff}.switch-field>span{display:grid;gap:4px}.switch-field strong{color:#45536a;font-size:10px}.scenario-step-grid{padding:0 11px 12px;display:grid;grid-template-columns:minmax(150px,1fr) minmax(0,2fr);gap:10px}.scenario-step-grid input{height:35px;padding:0 9px;border:1px solid #dfe5ee;border-radius:7px;color:#29364a;background:#fbfcfe;font:500 11px inherit}.scenario-options textarea:focus,.scenario-step-grid textarea:focus,.scenario-step-grid input:focus{border-color:#6b8de2;outline:0}.scenario-step-grid code{color:#456cbf}.scenario-metrics-title{margin-top:14px;color:#566278;font-size:11px;font-weight:800}.scenario-metric-cards{grid-template-columns:repeat(4,minmax(100px,1fr));margin-top:8px}
 .metrics-content>.metric-cards{grid-template-columns:repeat(4,minmax(100px,1fr))}.metric-cards>div.metric-good{border-color:#d7ebdf;background:#f7fcf9}.metric-cards>div.metric-good strong{color:#278555}.metric-cards>div.metric-bad{border-color:#f0dadd;background:#fff8f9}.metric-cards>div.metric-bad strong{color:#bd4654}.request-ratio{margin-top:10px;padding:10px;border:1px solid #e7ebf2;border-radius:8px;background:#fff}.request-ratio>div:first-child{display:flex;justify-content:space-between;color:#657187;font-size:9px}.request-ratio>div:first-child strong{color:#278555}.ratio-track{height:8px;margin:7px 0 5px;border-radius:5px;display:flex;overflow:hidden;background:#edf1f6}.ratio-track i{display:block;height:100%}.ratio-success{background:#42ad79}.ratio-failed{background:#dd6975}.request-ratio>small{color:#8994a7;font-size:8px}.request-ratio b{color:#536177}.latency-block{margin-top:10px;padding:10px;border-radius:8px;background:#f4f7fb}.latency-block>div:first-child{display:flex;justify-content:space-between;gap:10px}.latency-block>div:first-child strong{color:#566278;font-size:10px}.latency-block>div:first-child small{color:#929daf;font-size:8px}.latency-block .latency-row{margin-top:8px;padding:0}.counts-grid>div{display:block}.distribution-row{display:grid;grid-template-columns:minmax(75px,1fr) minmax(50px,2fr) 28px 38px;align-items:center;gap:6px;margin-top:7px}.counts-grid .distribution-row code{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.counts-grid .distribution-row>span{height:5px;margin:0;padding:0;border-radius:4px;display:block;overflow:hidden;background:#edf1f6}.distribution-row>span i{height:100%;display:block;border-radius:4px;background:#5c83df}.error-distribution .distribution-row>span i{background:#dc6874}.distribution-row>strong{color:#43516a;text-align:right;font-size:9px}.distribution-row>small{color:#929daf;text-align:right;font-size:8px}.target-table-wrap td:nth-child(4){color:#bd4654}.target-table-wrap td:nth-child(5){font-weight:700}.table-unit{display:block;margin-top:5px;color:#929daf;text-align:right;font-size:8px}
-.response-samples{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.response-samples>section{min-width:0;padding:10px;border:1px solid #d9ebdf;border-radius:8px;background:#f8fcf9}.response-samples>section.failed-samples{border-color:#f0dadd;background:#fff9fa}.response-samples h4{margin:0 0 7px;color:#397252;font-size:10px}.response-samples .failed-samples h4{color:#a84a56}.response-samples h4 span{margin-left:4px}.response-samples p{margin:0;color:#9aa4b4;font-size:9px}.response-samples details{margin-top:6px;border:1px solid #e5eaf0;border-radius:6px;overflow:hidden;background:#fff}.response-samples summary{padding:7px;display:flex;justify-content:space-between;gap:8px;color:#68758a;font-size:9px;cursor:pointer}.response-samples summary strong{color:#344158}.response-samples pre{max-height:240px;margin:0;padding:9px;overflow:auto;border-top:1px solid #edf0f5;color:#334159;background:#f7f9fc;font:10px/1.5 Consolas,"Microsoft YaHei",monospace;white-space:pre-wrap;word-break:break-all}
+.dynamic-help{margin-top:14px;padding:14px 16px;border:1px solid #bfcff3;border-radius:10px;background:#f5f8ff}.dynamic-help summary{color:#3159b1;font-size:14px;font-weight:800;cursor:pointer}.dynamic-help summary small{margin-left:8px;color:#677796;font-size:11px;font-weight:500}.dynamic-help>p{margin:12px 0;color:#4f5f78;font-size:12px;line-height:1.6}.dynamic-token-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.dynamic-token-list>div{min-width:0;padding:9px;border:1px solid #d8e2f7;border-radius:7px;display:grid;gap:5px;background:#fff}.dynamic-token-list code{overflow:auto;color:#294f9d;font:600 11px/1.5 Consolas,"Microsoft YaHei",monospace;white-space:nowrap}.dynamic-token-list span{color:#69768a;font-size:11px}.dynamic-example{margin-top:12px;display:grid;gap:7px}.dynamic-example>span{color:#40506a;font-size:12px;font-weight:800}.dynamic-example pre{margin:0;padding:12px;border:1px solid #cfdaf0;border-radius:7px;color:#253652;background:#fff;font:12px/1.65 Consolas,"Microsoft YaHei",monospace;white-space:pre-wrap}.dynamic-example small{color:#66748a;font-size:11px;line-height:1.5}.target-card .request-line input,.target-card .request-line select{font-size:13px}.target-card .json-grid label{font-size:12px}.target-card .json-grid textarea{font-size:12px;line-height:1.6}.target-card .json-grid small{font-size:10px;line-height:1.5}
+.response-details{margin-top:12px;padding:12px;border:1px solid #dce4f2;border-radius:9px;background:#fafcff}.response-details>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.response-details h4{margin:0;color:#42516a;font-size:12px}.response-details h4 span{margin-left:5px;color:#5274ca}.response-details header small{display:block;margin-top:3px;color:#8a96a9;font-size:9px}.response-details button{padding:5px 9px;border:1px solid #d7e0f0;border-radius:6px;color:#526baf;background:#fff;font-size:9px;font-weight:700;cursor:pointer}.response-details button:disabled{cursor:not-allowed;opacity:.5}.response-filters{display:flex;gap:6px;margin:10px 0}.response-filters button.active{border-color:#6f8fdc;color:#fff;background:#6182d5}.response-details>details{margin-top:7px;border:1px solid #d8eadf;border-radius:7px;overflow:hidden;background:#fff}.response-details>details.failed{border-color:#efd4d8}.response-details summary{padding:9px 10px;display:flex;justify-content:space-between;gap:10px;color:#68758a;font-size:10px;cursor:pointer}.response-details summary strong{color:#2f7650}.response-details details.failed summary strong{color:#b64c59}.response-details summary span{text-align:right}.response-details pre{margin:0;padding:12px;overflow:auto;border-top:1px solid #e8edf4;color:#263750;background:#f6f8fc;font:12px/1.6 Consolas,"Microsoft YaHei",monospace;white-space:pre-wrap;word-break:break-all}.response-warning{padding:8px 10px;border-top:1px solid #f0dadd;display:flex;gap:12px;flex-wrap:wrap;color:#a84a56;background:#fff8f9;font-size:9px}.response-empty,.response-error{margin:12px 0 0;font-size:10px}.response-empty{color:#929daf}.response-error{color:#b84350}.response-details>footer{margin-top:10px;display:flex;align-items:center;justify-content:space-between;color:#7d899c;font-size:9px}.response-details>footer div{display:flex;gap:6px}
 @media(max-width:1100px){.workspace{grid-template-columns:185px minmax(0,1fr)}.editor-toolbar{align-items:flex-start;flex-direction:column}.toolbar-actions{width:100%;overflow-x:auto}.number-grid{grid-template-columns:repeat(2,minmax(120px,1fr))}.metric-cards{grid-template-columns:repeat(2,minmax(100px,1fr))}}
-@media(max-width:760px){.page-header{align-items:flex-start}.workspace{display:block}.definition-list{max-height:220px;overflow:auto;border-right:0;border-bottom:1px solid #e8edf4}.mode-row,.json-grid,.counts-grid,.scenario-options,.scenario-step-grid,.response-samples{grid-template-columns:1fr}.number-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.history-layout{grid-template-columns:1fr}.history-list{max-height:170px;border-right:0;border-bottom:1px solid #edf0f5}.run-summary>div{flex-direction:column}.settings-card,.targets-section,.results-section{margin:10px}.request-line{grid-template-columns:90px minmax(0,1fr)}}
+@media(max-width:760px){.page-header{align-items:flex-start}.workspace{display:block}.definition-list{max-height:220px;overflow:auto;border-right:0;border-bottom:1px solid #e8edf4}.mode-row,.json-grid,.counts-grid,.scenario-options,.scenario-step-grid{grid-template-columns:1fr}.dynamic-token-list{grid-template-columns:1fr}.number-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.history-layout{grid-template-columns:1fr}.history-list{max-height:170px;border-right:0;border-bottom:1px solid #edf0f5}.run-summary>div,.response-details summary{flex-direction:column}.response-details summary span{text-align:left}.settings-card,.targets-section,.results-section{margin:10px}.request-line{grid-template-columns:90px minmax(0,1fr)}}
 @media(max-width:480px){.page-header{flex-direction:column}.page-header .primary{width:100%}.number-grid,.metric-cards{grid-template-columns:1fr}.targets-section>header{align-items:flex-start;flex-direction:column}.toolbar-actions .secondary{flex:0 0 auto}.metrics-area{padding:10px}}
 </style>

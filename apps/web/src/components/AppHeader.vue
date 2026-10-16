@@ -15,6 +15,7 @@ const props = defineProps<{
   createProjectError: string
   deletingProject: boolean
   deleteProjectError: string
+  hideProjectControls: boolean
 }>()
 const emit = defineEmits<{
   menu: []
@@ -82,7 +83,7 @@ watch(() => props.deletingProject, (isDeleting, wasDeleting) => {
       <div><span>智能测试平台</span><h1>{{ pageTitle }}</h1></div>
     </div>
     <div class="top-actions">
-      <div class="project-select-wrap">
+      <div v-if="!hideProjectControls" class="project-select-wrap">
         <label class="project-select">
           <span class="sr-only">选择项目</span>
           <span class="project-dot" aria-hidden="true"></span>

@@ -4,6 +4,7 @@ from logging.config import fileConfig
 from alembic import context
 
 from services.api.database import Base, create_database_engine
+from services.api.connector_models import ConnectorModel
 from services.api.auth_models import AuthBootstrapModel, UserModel, UserSessionModel
 from services.api.automation_models import (
     AutomationScriptModel,
@@ -20,7 +21,7 @@ from services.api.data_factory_models import (
     DataFactoryRunModel,
     DataFactoryWorkflowModel,
 )
-from services.api.load_test_models import LoadTestModel, LoadTestRunModel
+from services.api.load_test_models import LoadTestModel, LoadTestResponseModel, LoadTestRunModel
 from services.api.parameter_models import (
     AutomationScriptParameterModel,
     ParameterEnumSetModel,
@@ -57,7 +58,8 @@ _registered_models = (
     SecretCapabilityGrantModel,
     TestPlanModel, TestPlanRevisionModel, ExecutionBatchModel, RunSpecModel,
     DataFactoryWorkflowModel, DataFactoryRunModel,
-    LoadTestModel, LoadTestRunModel,
+    LoadTestModel, LoadTestRunModel, LoadTestResponseModel,
+    ConnectorModel,
 )
 
 

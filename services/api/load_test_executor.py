@@ -1,6 +1,6 @@
 """Bounded load execution with pinned, public-only HTTP destinations."""
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -8,11 +8,14 @@ from ipaddress import ip_address, ip_network
 import json
 from random import randrange
 import re
+import secrets
 import socket
+import string
 from threading import Event, Lock
 import time
 from typing import Any
 from urllib.parse import urlencode, urljoin, urlsplit
+from uuid import uuid4
 
 import requests
 import urllib3
@@ -28,20 +31,105 @@ from .load_test_domain import (
 RequestCallable = Callable[..., Any]
 Resolver = Callable[[str], Iterable[str]]
 SnapshotCallable = Callable[[dict[str, Any]], None]
+ResponseCallable = Callable[[dict[str, Any]], None]
 _SAMPLE_LIMIT = 10_000
 _RESPONSE_LIMIT = 1_048_576
-_RESPONSE_PREVIEW_BYTES = 8_192
 _SUCCESS_RESPONSE_SAMPLES = 5
 _FAILED_RESPONSE_SAMPLES = 10
 _SENSITIVE_RESPONSE_KEYS = (
     "authorization", "cookie", "password", "passwd", "secret", "token",
 )
 _HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_DYNAMIC_TEMPLATE = re.compile(
+    r"\{\{\$([A-Za-z][A-Za-z0-9]*(?:\([^{}]{0,128}\))?)\}\}"
+)
 _EXPLICITLY_BLOCKED_NETWORKS = (
     ip_network("0.0.0.0/8"),
     ip_network("100.64.0.0/10"),
     ip_network("192.0.0.0/24"),
 )
+
+
+def _stringify_dynamic_value(value: Any) -> str:
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def _generate_dynamic_value(expression: str, sequence: int) -> Any:
+    if expression == "uuid":
+        return str(uuid4())
+    if expression == "sequence":
+        return sequence
+    if expression == "timestamp":
+        return int(time.time())
+    if expression == "timestampMs":
+        return int(time.time() * 1000)
+    if expression == "randomBoolean":
+        return bool(secrets.randbelow(2))
+    if expression == "randomPhone":
+        return "1" + secrets.choice("3456789") + "".join(
+            secrets.choice(string.digits) for _ in range(9)
+        )
+    if expression == "randomEmail":
+        local = "".join(secrets.choice(string.ascii_lowercase + string.digits)
+                        for _ in range(10))
+        return f"test_{local}@example.com"
+
+    integer = re.fullmatch(
+        r"randomInt\(\s*(-?[0-9]{1,10})\s*,\s*(-?[0-9]{1,10})\s*\)", expression,
+    )
+    if integer:
+        minimum, maximum = map(int, integer.groups())
+        if minimum < -1_000_000_000 or maximum > 1_000_000_000 or minimum > maximum:
+            raise WorkflowExecutionError("a dynamic template is invalid")
+        return minimum + secrets.randbelow(maximum - minimum + 1)
+
+    sized = re.fullmatch(r"random(String|Digits)\(\s*([0-9]{1,3})\s*\)", expression)
+    if sized:
+        kind, raw_length = sized.groups()
+        length = int(raw_length)
+        if not 1 <= length <= 128:
+            raise WorkflowExecutionError("a dynamic template is invalid")
+        alphabet = string.ascii_letters + string.digits if kind == "String" else string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(length))
+
+    choice = re.fullmatch(r"randomChoice\(([^()]*)\)", expression)
+    if choice:
+        options = [item.strip() for item in choice.group(1).split(",")]
+        if not 2 <= len(options) <= 20 or any(
+            not item or len(item) > 128 for item in options
+        ):
+            raise WorkflowExecutionError("a dynamic template is invalid")
+        return secrets.choice(options)
+    raise WorkflowExecutionError("a dynamic template is invalid")
+
+
+def render_dynamic_templates(value: Any, sequence: int,
+                             cache: dict[str, Any] | None = None) -> Any:
+    """Render bounded per-request {{$...}} values while preserving JSON types."""
+    resolved = cache if cache is not None else {}
+
+    def generate(expression: str) -> Any:
+        if expression not in resolved:
+            resolved[expression] = _generate_dynamic_value(expression, sequence)
+        return resolved[expression]
+
+    if isinstance(value, str):
+        whole = _DYNAMIC_TEMPLATE.fullmatch(value)
+        if whole:
+            return deepcopy(generate(whole.group(1)))
+
+        def replace(match: re.Match[str]) -> str:
+            return _stringify_dynamic_value(generate(match.group(1)))
+
+        return _DYNAMIC_TEMPLATE.sub(replace, value)
+    if isinstance(value, list):
+        return [render_dynamic_templates(item, sequence, resolved) for item in value]
+    if isinstance(value, Mapping):
+        return {
+            key: render_dynamic_templates(item, sequence, resolved)
+            for key, item in value.items()
+        }
+    return deepcopy(value)
 
 
 class LoadTestExecutionError(ValueError):
@@ -114,7 +202,7 @@ class _Metrics:
 
     def add(self, name: str, latency: float, success: bool,
             status: int | None, error: str | None,
-            response: dict[str, Any] | None = None) -> None:
+            response: dict[str, Any] | None = None) -> int:
         with self._lock:
             self._all.add(latency, success, status, error)
             self._targets[name].add(latency, success, status, error)
@@ -124,20 +212,20 @@ class _Metrics:
                 details = response or {
                     "body": None, "body_kind": "unavailable", "truncated": False,
                 }
+                body_kind = details.get("body_kind", "unavailable")
+                sample_kind = body_kind if body_kind in {"json", "empty"} else (
+                    "truncated" if details.get("truncated") else "non_json"
+                )
                 self._response_samples[category].append({
                     "target": name, "status": status, "latency_ms": round(latency, 3),
-                    "error": error, **deepcopy(details),
+                    "error": error, "body": deepcopy(details.get("sample_body")),
+                    "body_kind": sample_kind, "truncated": bool(details.get("truncated")),
                 })
+            return self._all.total
 
     def add_scenario(self, latency: float, success: bool) -> None:
         with self._lock:
             self._scenarios.add(latency, success, None, None)
-
-    def should_capture(self, success: bool) -> bool:
-        with self._lock:
-            category = "successful" if success else "failed"
-            limit = _SUCCESS_RESPONSE_SAMPLES if success else _FAILED_RESPONSE_SAMPLES
-            return len(self._response_samples[category]) < limit
 
     def periodic_snapshot(self) -> dict[str, Any] | None:
         with self._lock:
@@ -242,11 +330,12 @@ class LoadTestExecutor:
 
     def execute(self, definition: LoadTestRecord, *, cancel_event: Event | None = None,
                 snapshot_callback: SnapshotCallable | None = None,
-                auth_config: LoadTestAuthConfiguration | None = None) -> dict[str, Any]:
+                auth_config: LoadTestAuthConfiguration | None = None,
+                response_callback: ResponseCallable | None = None) -> dict[str, Any]:
         cancel = cancel_event or Event()
         if definition.traffic_mode == LoadTestTrafficMode.SCENARIO:
             return self._execute_scenarios(
-                definition, cancel, snapshot_callback, auth_config,
+                definition, cancel, snapshot_callback, auth_config, response_callback,
             )
         prepared_targets = [self._prepare_target(target, auth_config)
                             for target in definition.targets]
@@ -271,14 +360,31 @@ class LoadTestExecutor:
                         return
                     index, sequence = sequence, sequence + 1
                 target_index = index % len(definition.targets)
-                target = prepared_targets[target_index]
                 before = time.monotonic()
-                status, success, error, response = self._request_target(
-                    target, destinations[target_index], definition.timeout_seconds,
-                    metrics.should_capture,
-                )
+                status: int | None = None
+                response: dict[str, Any] | None = None
+                try:
+                    target = render_dynamic_templates(
+                        prepared_targets[target_index], index + 1,
+                    )
+                    destination = self._rendered_destination(
+                        target["url"], destinations[target_index],
+                    )
+                    status, success, error, response = self._request_target(
+                        target, destination, definition.timeout_seconds,
+                    )
+                except WorkflowExecutionError:
+                    success, error = False, "template_error"
                 latency = (time.monotonic() - before) * 1000
-                metrics.add(target["name"], latency, success, status, error, response)
+                response_sequence = metrics.add(
+                    prepared_targets[target_index]["name"], latency,
+                    success, status, error, response,
+                )
+                if response_callback is not None:
+                    response_callback(self._response_record(
+                        response_sequence, prepared_targets[target_index]["name"],
+                        success, status, latency, error, response,
+                    ))
                 snapshot = metrics.periodic_snapshot()
                 if snapshot is not None and snapshot_callback is not None:
                     snapshot_callback(snapshot)
@@ -305,6 +411,7 @@ class LoadTestExecutor:
         self, definition: LoadTestRecord, cancel: Event,
         snapshot_callback: SnapshotCallable | None,
         auth_config: LoadTestAuthConfiguration | None,
+        response_callback: ResponseCallable | None,
     ) -> dict[str, Any]:
         token = self._authentication_token(auth_config, definition.timeout_seconds)
         started = time.monotonic()
@@ -321,6 +428,7 @@ class LoadTestExecutor:
                     if definition.mode == LoadTestMode.DURATION and time.monotonic() >= deadline:
                         return
                     sequence += 1
+                    scenario_sequence = sequence
                 scenario_started = time.monotonic()
                 variables = deepcopy(definition.initial_variables)
                 scenario_success = True
@@ -338,12 +446,13 @@ class LoadTestExecutor:
                     response: dict[str, Any] | None = None
                     try:
                         target = self._render_scenario_target(raw_target, variables)
+                        target = render_dynamic_templates(target, scenario_sequence)
                         target = self._prepare_target(target, auth_config)
                         if token is not None and auth_config is not None:
                             target = self._inject_auth(target, auth_config, token)
                         destination = self._validate_public_url(target["url"])
                         status, success, error, extracted, response = self._request_scenario_target(
-                            target, destination, definition.timeout_seconds, metrics.should_capture,
+                            target, destination, definition.timeout_seconds,
                         )
                         if success:
                             variables.update(extracted)
@@ -352,7 +461,14 @@ class LoadTestExecutor:
                     except (KeyError, TypeError, ValueError):
                         success, error = False, "request_error"
                     latency = (time.monotonic() - before) * 1000
-                    metrics.add(raw_target["name"], latency, success, status, error, response)
+                    response_sequence = metrics.add(
+                        raw_target["name"], latency, success, status, error, response,
+                    )
+                    if response_callback is not None:
+                        response_callback(self._response_record(
+                            response_sequence, raw_target["name"], success,
+                            status, latency, error, response,
+                        ))
                     if not success:
                         scenario_success = False
                     snapshot = metrics.periodic_snapshot()
@@ -414,6 +530,25 @@ class LoadTestExecutor:
         prepared["query"] = dict(target["query"])
         prepared["url"] = self._resolve_url(target["url"], config.base_url if config else None)
         return prepared
+
+    @staticmethod
+    def _rendered_destination(
+        url: str, destination: tuple[Any, tuple[Any, ...]],
+    ) -> tuple[Any, tuple[Any, ...]]:
+        pinned, addresses = destination
+        rendered = urlsplit(url)
+        try:
+            pinned_port = pinned.port or (443 if pinned.scheme.lower() == "https" else 80)
+            rendered_port = rendered.port or (443 if rendered.scheme.lower() == "https" else 80)
+        except ValueError:
+            raise WorkflowExecutionError("a dynamic URL is invalid") from None
+        if (
+            rendered.scheme.lower(), (rendered.hostname or "").lower(), rendered_port,
+        ) != (
+            pinned.scheme.lower(), (pinned.hostname or "").lower(), pinned_port,
+        ):
+            raise WorkflowExecutionError("a dynamic URL cannot change its destination")
+        return rendered, addresses
 
     @staticmethod
     def _resolve_url(url: str, base_url: str | None) -> str:
@@ -560,7 +695,7 @@ class LoadTestExecutor:
         return headers
 
     def _request_target(self, target: dict[str, Any], destination: tuple[Any, tuple[Any, ...]],
-                        timeout: float, should_capture: Callable[[bool], bool]) -> tuple[
+                        timeout: float) -> tuple[
                             int | None, bool, str | None, dict[str, Any] | None,
                         ]:
         response = None
@@ -578,10 +713,8 @@ class LoadTestExecutor:
             raw_status = getattr(response, "status_code", None)
             status = int(raw_status if raw_status is not None else response.status)
             success = status in set(target["expected_statuses"])
-            details = (
-                self._response_preview(self._read_preview_body(response))
-                if should_capture(success) else None
-            )
+            raw_body, truncated, body_bytes = self._read_captured_body(response)
+            details = self._response_details(raw_body, truncated, body_bytes)
             return status, success, None if success else "unexpected_status", details
         except (requests.RequestException, urllib3.exceptions.HTTPError,
                 OSError, TypeError, ValueError):
@@ -592,7 +725,7 @@ class LoadTestExecutor:
 
     def _request_scenario_target(
         self, target: dict[str, Any], destination: tuple[Any, tuple[Any, ...]],
-        timeout: float, should_capture: Callable[[bool], bool],
+        timeout: float,
     ) -> tuple[int | None, bool, str | None, dict[str, Any], dict[str, Any] | None]:
         response = None
         try:
@@ -608,28 +741,23 @@ class LoadTestExecutor:
                 )
             raw_status = getattr(response, "status_code", None)
             status = int(raw_status if raw_status is not None else response.status)
+            raw_body, truncated, body_bytes = self._read_captured_body(response)
+            details = self._response_details(raw_body, truncated, body_bytes)
             if status not in set(target["expected_statuses"]):
-                details = (
-                    self._response_preview(self._read_preview_body(response))
-                    if should_capture(False) else None
-                )
                 return status, False, "unexpected_status", {}, details
             if not target["extractors"]:
-                details = (
-                    self._response_preview(self._read_preview_body(response))
-                    if should_capture(True) else None
-                )
                 return status, True, None, {}, details
             try:
-                raw_body = self._read_limited_body(response)
+                if truncated:
+                    raise ValueError
                 payload = json.loads(raw_body)
                 extracted = {
                     name: deepcopy(self._extract_token(payload, path))
                     for name, path in target["extractors"].items()
                 }
             except (TypeError, ValueError, UnicodeError):
-                return status, False, "extractor_error", {}, None
-            return status, True, None, extracted, self._response_preview(raw_body)
+                return status, False, "extractor_error", {}, details
+            return status, True, None, extracted, details
         except (requests.RequestException, urllib3.exceptions.HTTPError,
                 OSError, TypeError, ValueError):
             return None, False, "request_error", {}, None
@@ -638,41 +766,75 @@ class LoadTestExecutor:
                 response.close()
 
     @staticmethod
-    def _read_preview_body(response: Any) -> bytes:
+    def _read_captured_body(response: Any) -> tuple[bytes, bool, int]:
         source = getattr(response, "response", response)
-        limit = _RESPONSE_PREVIEW_BYTES + 1
+        limit = _RESPONSE_LIMIT + 1
         if callable(getattr(source, "read", None)):
             body = source.read(limit)
         elif callable(getattr(source, "iter_content", None)):
             chunks, size = [], 0
-            for chunk in source.iter_content(chunk_size=4_096):
+            for chunk in source.iter_content(chunk_size=65_536):
                 chunks.append(chunk)
                 size += len(chunk)
                 if size >= limit:
                     break
             body = b"".join(chunks)[:limit]
         elif callable(getattr(source, "json", None)):
-            body = json.dumps(source.json(), ensure_ascii=False).encode("utf-8")[:limit]
+            body = json.dumps(source.json(), ensure_ascii=False).encode("utf-8")
         else:
-            body = getattr(source, "content", b"")[:limit]
+            body = getattr(source, "content", b"")
         if not isinstance(body, bytes):
             raise ValueError
-        return body
+        body_bytes = len(body)
+        return body[:_RESPONSE_LIMIT], body_bytes > _RESPONSE_LIMIT, body_bytes
 
     @classmethod
-    def _response_preview(cls, raw: bytes) -> dict[str, Any]:
-        truncated = len(raw) > _RESPONSE_PREVIEW_BYTES
-        preview = raw[:_RESPONSE_PREVIEW_BYTES]
-        if not preview:
-            return {"body": None, "body_kind": "empty", "truncated": False}
-        if truncated:
-            return {"body": None, "body_kind": "truncated", "truncated": True}
+    def _response_details(cls, raw: bytes, truncated: bool,
+                          body_bytes: int) -> dict[str, Any]:
+        if not raw:
+            return {"body": None, "sample_body": None, "body_kind": "empty",
+                    "truncated": truncated, "body_bytes": body_bytes}
         try:
-            payload = json.loads(preview.decode("utf-8"))
+            text = raw.decode("utf-8")
+        except UnicodeError:
+            return {"body": None, "sample_body": None, "body_kind": "binary",
+                    "truncated": truncated, "body_bytes": body_bytes}
+        try:
+            payload = json.loads(text) if not truncated else None
         except (UnicodeError, json.JSONDecodeError):
-            return {"body": None, "body_kind": "non_json", "truncated": False}
+            payload = None
+        if payload is None:
+            return {"body": cls._redact_text(text), "sample_body": None,
+                    "body_kind": "text", "truncated": truncated,
+                    "body_bytes": body_bytes}
+        redacted = cls._redact_response(payload)
         return {
-            "body": cls._redact_response(payload), "body_kind": "json", "truncated": False,
+            "body": json.dumps(redacted, ensure_ascii=False, indent=2),
+            "sample_body": redacted, "body_kind": "json",
+            "truncated": False, "body_bytes": body_bytes,
+        }
+
+    @staticmethod
+    def _redact_text(value: str) -> str:
+        pattern = re.compile(
+            r'(?i)(authorization|cookie|password|passwd|secret|token)(\s*[=:]\s*)([^\s,;&]+)'
+        )
+        return pattern.sub(r'\1\2[REDACTED]', value)
+
+    @staticmethod
+    def _response_record(sequence: int, target: str, successful: bool,
+                         status: int | None, latency: float, error: str | None,
+                         response: dict[str, Any] | None) -> dict[str, Any]:
+        details = response or {
+            "body": None, "body_kind": "unavailable", "truncated": False,
+            "body_bytes": 0,
+        }
+        return {
+            "sequence": sequence, "target": target, "successful": successful,
+            "status": status, "latency_ms": round(latency, 3), "error": error,
+            "body": details.get("body"), "body_kind": details["body_kind"],
+            "truncated": bool(details.get("truncated")),
+            "body_bytes": int(details.get("body_bytes", 0)),
         }
 
     @classmethod

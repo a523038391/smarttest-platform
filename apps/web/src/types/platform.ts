@@ -11,6 +11,7 @@ export type NavKey =
   | 'environments'
   | 'data-factory'
   | 'version-control'
+  | 'connectors'
 
 export type IconName = NavKey | 'menu' | 'bell' | 'refresh' | 'search' | 'close'
 
@@ -86,4 +87,5 @@ export const navigationItems: NavigationItem[] = [
   { key: 'environments', label: '环境配置', icon: 'data-factory' },
   { key: 'data-factory', label: '数据工厂', icon: 'data-factory' },
   { key: 'version-control', label: '代码版本', icon: 'version-control' },
+  { key: 'connectors', label: '连接器中心', icon: 'connectors' },
 ]

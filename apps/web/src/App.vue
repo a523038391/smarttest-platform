@@ -4,6 +4,7 @@ import AppHeader from './components/AppHeader.vue'
 import AppSidebar from './components/AppSidebar.vue'
 import AuthView from './components/AuthView.vue'
 import AutomationView from './components/AutomationView.vue'
+import ConnectorCenterView from './components/ConnectorCenterView.vue'
 import DashboardView from './components/DashboardView.vue'
 import DataFactoryView from './components/DataFactoryView.vue'
 import ExecutionCenter from './components/ExecutionCenter.vue'
@@ -196,6 +197,7 @@ onBeforeUnmount(() => {
         :create-project-error="createProjectError"
         :deleting-project="deletingProject"
         :delete-project-error="deleteProjectError"
+        :hide-project-controls="activePage === 'connectors'"
         @menu="sidebarOpen = true"
         @logout="handleLogout"
         @select="selectedProjectId = $event"
@@ -242,6 +244,7 @@ onBeforeUnmount(() => {
           :projects-error="projectsError"
         />
         <VersionControlView v-else-if="activePage === 'version-control'" />
+        <ConnectorCenterView v-else-if="activePage === 'connectors'" />
         <PlaceholderView v-else :title="pageTitle" />
       </main>
     </div>

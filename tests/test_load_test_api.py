@@ -22,6 +22,7 @@ class Response:
 def payload(project_id: str) -> dict:
     return {
         "project_id": project_id, "name": "Smoke load", "description": "",
+        "category": "采购",
         "targets": [{
             "name": "Health", "method": "GET", "url": "https://example.test/health",
             "headers": {}, "query": {}, "body": None, "expected_statuses": [200],
@@ -38,6 +39,7 @@ def test_load_test_crud_validation_and_project_guard() -> None:
     assert created.status_code == 201
     body = created.json()
     assert body["state_version"] == 0
+    assert body["category"] == "采购"
     assert body["traffic_mode"] == "REQUESTS"
     assert body["initial_variables"] == {}
     assert body["stop_on_failure"] is True
@@ -46,8 +48,9 @@ def test_load_test_crud_validation_and_project_guard() -> None:
     assert client.get("/api/v1/load-tests", params={"project_id": project["id"]}).json()["total"] == 1
     update = {key: value for key, value in payload(project["id"]).items()
               if key != "project_id"}
-    update.update({"description": "updated", "state_version": 0})
-    assert client.put(f"/api/v1/load-tests/{body['id']}", json=update).json()["state_version"] == 1
+    update.update({"description": "updated", "category": "  回归  ", "state_version": 0})
+    updated = client.put(f"/api/v1/load-tests/{body['id']}", json=update).json()
+    assert updated["state_version"] == 1 and updated["category"] == "回归"
     assert client.put(f"/api/v1/load-tests/{body['id']}", json=update).status_code == 409
     assert client.delete(f"/api/v1/projects/{project['id']}").status_code == 409
     invalid = {**payload(project["id"]), "name": "Invalid", "concurrency": 101}
@@ -206,6 +209,10 @@ def test_run_is_accepted_persisted_and_second_active_run_rejected() -> None:
     assert result["metrics"]["total_requests"] == 1
     listed = client.get(f"/api/v1/load-tests/{definition['id']}/runs").json()
     assert listed["items"][0]["id"] == run_id
+    responses = client.get(f"/api/v1/load-test-runs/{run_id}/responses").json()
+    assert responses["total"] == 1
+    assert responses["items"][0]["sequence"] == 1
+    assert responses["items"][0]["successful"] is True
 
 
 def test_running_load_test_can_be_cancelled() -> None:

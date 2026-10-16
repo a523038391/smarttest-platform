@@ -6,7 +6,8 @@ from pydantic import Field, field_validator, model_validator
 
 from .data_factory_schemas import VARIABLE_PATTERN, _bounded_json
 from .load_test_domain import (
-    LoadTestMode, LoadTestRecord, LoadTestRunRecord, LoadTestTrafficMode,
+    LoadTestMode, LoadTestRecord, LoadTestResponseRecord, LoadTestRunRecord,
+    LoadTestTrafficMode,
 )
 from .schemas import ApiModel
 
@@ -69,6 +70,7 @@ class LoadTestTarget(ApiModel):
 class _LoadTestBody(ApiModel):
     name: str = Field(min_length=1, max_length=255)
     description: str = Field(default="", max_length=100_000)
+    category: str = Field(default="", max_length=100)
     targets: list[LoadTestTarget] = Field(min_length=1, max_length=20)
     mode: LoadTestMode
     request_count: int = Field(default=1, ge=1, le=10_000)
@@ -88,6 +90,11 @@ class _LoadTestBody(ApiModel):
         if not value:
             raise ValueError("load test name must not be blank")
         return value
+
+    @field_validator("category")
+    @classmethod
+    def normalize_category(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("initial_variables")
     @classmethod
@@ -149,3 +156,30 @@ class LoadTestRunResponse(ApiModel):
 class LoadTestRunListResponse(ApiModel):
     items: list[LoadTestRunResponse]
     total: int
+
+
+class LoadTestResponseDetail(ApiModel):
+    id: UUID
+    run_id: UUID
+    sequence: int
+    target: str
+    successful: bool
+    status: int | None
+    latency_ms: float
+    error: str | None
+    body: str | None
+    body_kind: Literal["json", "text", "empty", "binary", "unavailable"]
+    truncated: bool
+    body_bytes: int
+    created_at: datetime
+
+    @classmethod
+    def from_record(cls, record: LoadTestResponseRecord) -> "LoadTestResponseDetail":
+        return cls.model_validate(record, from_attributes=True)
+
+
+class LoadTestResponseDetailList(ApiModel):
+    items: list[LoadTestResponseDetail]
+    total: int
+    offset: int
+    limit: int

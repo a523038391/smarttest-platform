@@ -41,6 +41,19 @@ def canonical_aad(
     ).encode("utf-8")
 
 
+def canonical_connector_aad(connector_id: UUID, secret_revision: int) -> bytes:
+    return json.dumps(
+        {
+            "aad_version": AAD_VERSION,
+            "connector_id": str(connector_id),
+            "purpose": "connector-credential",
+            "secret_revision": secret_revision,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 class SecretEncryptor:
     def __init__(self, key: bytes | None, key_id: str | None) -> None:
         if (key is None) != (key_id is None):
@@ -96,6 +109,41 @@ class SecretEncryptor:
         if encrypted.key_id != key_id or encrypted.algorithm != ALGORITHM:
             raise SecretDecryptionError("secret value is unavailable")
         aad = canonical_aad(project_id, environment_id, revision, category, name)
+        try:
+            dek = AESGCM(key).decrypt(
+                encrypted.wrap_nonce, encrypted.wrapped_dek, aad + b"|dek-wrap"
+            )
+            plaintext = AESGCM(dek).decrypt(
+                encrypted.nonce, encrypted.ciphertext + encrypted.tag, aad
+            )
+            return plaintext.decode("utf-8")
+        except (InvalidTag, UnicodeDecodeError, ValueError):
+            raise SecretDecryptionError("secret value is unavailable") from None
+
+    def encrypt_connector(
+        self, value: str, *, connector_id: UUID, secret_revision: int
+    ) -> EncryptedSecret:
+        key, key_id = self._require_key()
+        aad = canonical_connector_aad(connector_id, secret_revision)
+        dek = AESGCM.generate_key(bit_length=256)
+        nonce, wrap_nonce = os.urandom(12), os.urandom(12)
+        sealed = AESGCM(dek).encrypt(nonce, value.encode("utf-8"), aad)
+        wrapped = AESGCM(key).encrypt(wrap_nonce, dek, aad + b"|dek-wrap")
+        return EncryptedSecret(
+            sealed[:-16], sealed[-16:], nonce, wrapped, wrap_nonce, key_id, ALGORITHM
+        )
+
+    def decrypt_connector(
+        self,
+        encrypted: EncryptedSecret,
+        *,
+        connector_id: UUID,
+        secret_revision: int,
+    ) -> str:
+        key, key_id = self._require_key()
+        if encrypted.key_id != key_id or encrypted.algorithm != ALGORITHM:
+            raise SecretDecryptionError("secret value is unavailable")
+        aad = canonical_connector_aad(connector_id, secret_revision)
         try:
             dek = AESGCM(key).decrypt(
                 encrypted.wrap_nonce, encrypted.wrapped_dek, aad + b"|dek-wrap"

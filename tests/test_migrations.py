@@ -19,13 +19,14 @@ def test_sqlite_upgrades_from_empty_database_to_head(tmp_path, monkeypatch) -> N
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "0017"
+            ).scalar_one() == "0021"
             tables = set(inspect(connection).get_table_names())
             assert {
                 "projects", "run_specs", "secret_capability_grants",
                 "parameter_enum_sets", "automation_script_parameters",
                 "data_factory_workflows", "data_factory_runs",
-                "load_tests", "load_test_runs",
+                "load_tests", "load_test_runs", "load_test_responses",
+                "connectors",
             } <= tables
             run_spec_columns = {
                 column["name"]: column for column in inspect(connection).get_columns("run_specs")
@@ -52,10 +53,25 @@ def test_sqlite_upgrades_from_empty_database_to_head(tmp_path, monkeypatch) -> N
             assert load_test_columns["traffic_mode"]["nullable"] is False
             assert load_test_columns["initial_variables"]["nullable"] is False
             assert load_test_columns["stop_on_failure"]["nullable"] is False
+            assert load_test_columns["category"]["nullable"] is False
             assert {
                 key["referred_table"]
                 for key in inspect(connection).get_foreign_keys("load_tests")
             } == {"projects", "project_environments"}
+            assert {
+                key["referred_table"]
+                for key in inspect(connection).get_foreign_keys("load_test_responses")
+            } == {"load_test_runs"}
+            connector_columns = {
+                column["name"]: column
+                for column in inspect(connection).get_columns("connectors")
+            }
+            assert "project_id" not in connector_columns
+            assert {
+                "name", "kind", "base_url", "auth_type", "auth_header", "enabled",
+                "timeout_seconds", "state_version", "secret_revision", "tools",
+                "last_tested_at", "last_test_success", "last_error",
+            } <= connector_columns.keys()
             assert {
                 key["referred_table"]
                 for key in inspect(connection).get_foreign_keys(

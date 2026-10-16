@@ -1,6 +1,7 @@
 import json
+import re
 from threading import Event
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -76,6 +77,62 @@ def test_count_execution_is_bounded_and_samples_limited_bodies() -> None:
     assert all(call["allow_redirects"] is False and call["stream"] is True for call in calls)
 
 
+def test_request_mode_renders_typed_dynamic_values_per_request() -> None:
+    calls = []
+    target = {
+        "name": "dynamic", "method": "post",
+        "url": "https://example.test/items/{{$sequence}}",
+        "headers": {"X-Request-ID": "{{$uuid}}"},
+        "query": {"page": "{{$randomInt(2,2)}}"},
+        "body": {
+            "requestId": "{{$uuid}}", "sequence": "{{$sequence}}",
+            "timestamp": "{{$timestamp}}", "timestampMs": "{{$timestampMs}}",
+            "code": "CODE-{{$randomDigits(6)}}", "name": "{{$randomString(8)}}",
+            "phone": "{{$randomPhone}}", "email": "{{$randomEmail}}",
+            "enabled": "{{$randomBoolean}}",
+            "status": "{{$randomChoice(draft,paid,closed)}}",
+        },
+        "expected_statuses": [200],
+    }
+
+    metrics = LoadTestExecutor(
+        request_callable=lambda **kwargs: calls.append(kwargs) or Response(),
+        resolver=lambda _: ["93.184.216.34"],
+    ).execute(definition(count=3, concurrency=1, targets=[target]))
+
+    assert metrics["successful_requests"] == 3
+    assert [call["url"].rsplit("/", 1)[1] for call in calls] == ["1", "2", "3"]
+    assert [call["json"]["sequence"] for call in calls] == [1, 2, 3]
+    assert all(call["params"]["page"] == 2 for call in calls)
+    assert all(call["headers"]["X-Request-ID"] == call["json"]["requestId"] for call in calls)
+    assert len({call["json"]["requestId"] for call in calls}) == 3
+    assert all(UUID(call["json"]["requestId"]) for call in calls)
+    assert all(re.fullmatch(r"CODE-[0-9]{6}", call["json"]["code"]) for call in calls)
+    assert all(len(call["json"]["name"]) == 8 for call in calls)
+    assert all(re.fullmatch(r"1[3-9][0-9]{9}", call["json"]["phone"]) for call in calls)
+    assert all(call["json"]["email"].endswith("@example.com") for call in calls)
+    assert all(isinstance(call["json"]["enabled"], bool) for call in calls)
+    assert all(call["json"]["status"] in {"draft", "paid", "closed"} for call in calls)
+
+
+def test_invalid_dynamic_template_is_counted_without_sending_request() -> None:
+    calls = []
+    target = {
+        "name": "invalid", "method": "post", "url": "https://example.test/items",
+        "headers": {}, "query": {}, "body": {"value": "{{$randomInt(10,1)}}"},
+        "expected_statuses": [200],
+    }
+
+    metrics = LoadTestExecutor(
+        request_callable=lambda **kwargs: calls.append(kwargs) or Response(),
+        resolver=lambda _: ["93.184.216.34"],
+    ).execute(definition(count=1, concurrency=1, targets=[target]))
+
+    assert calls == []
+    assert metrics["failed_requests"] == 1
+    assert metrics["error_counts"] == {"template_error": 1}
+
+
 def test_response_samples_include_failures_and_redact_sensitive_json() -> None:
     responses = [
         Response(b'{"data":{"id":1},"accessToken":"secret-value"}'),
@@ -107,6 +164,44 @@ def test_response_samples_are_bounded_and_omit_unsafe_text() -> None:
     assert len(samples) == 5
     assert all(sample["body"] is None and sample["body_kind"] == "non_json"
                for sample in samples)
+
+
+def test_response_callback_receives_every_full_json_and_text_body() -> None:
+    records = []
+    large_value = "x" * 20_000
+    responses = [
+        Response(json.dumps({"value": large_value, "token": "hidden"}).encode()),
+        Response(b"plain response text"),
+    ]
+
+    metrics = LoadTestExecutor(
+        request_callable=lambda **_: responses.pop(0),
+        resolver=lambda _: ["93.184.216.34"],
+    ).execute(
+        definition(count=2, concurrency=1), response_callback=records.append,
+    )
+
+    assert metrics["total_requests"] == len(records) == 2
+    assert [item["sequence"] for item in records] == [1, 2]
+    assert large_value in records[0]["body"]
+    assert "hidden" not in records[0]["body"]
+    assert records[0]["body_kind"] == "json" and not records[0]["truncated"]
+    assert records[1]["body"] == "plain response text"
+    assert records[1]["body_kind"] == "text"
+
+
+def test_response_callback_marks_body_over_one_mib_as_truncated() -> None:
+    records = []
+    LoadTestExecutor(
+        request_callable=lambda **_: Response(b"x" * (1_048_576 + 10)),
+        resolver=lambda _: ["93.184.216.34"],
+    ).execute(
+        definition(count=1, concurrency=1), response_callback=records.append,
+    )
+
+    assert len(records[0]["body"]) == 1_048_576
+    assert records[0]["truncated"] is True
+    assert records[0]["body_bytes"] == 1_048_586
 
 
 def test_duration_execution_observes_cancellation() -> None:
@@ -179,7 +274,9 @@ def test_scenario_executes_ordered_rounds_with_typed_templates_and_extraction() 
     targets = [{
         "name": "create", "method": "POST",
         "url": "https://example.test/users/{{seed}}", "headers": {},
-        "query": {}, "body": {"enabled": "{{enabled}}"},
+        "query": {}, "body": {
+            "enabled": "{{enabled}}", "sequence": "{{$sequence}}",
+        },
         "expected_statuses": [200], "extractors": {"item_id": "data.items[0].id"},
     }, {
         "name": "read", "method": "POST",
@@ -208,7 +305,8 @@ def test_scenario_executes_ordered_rounds_with_typed_templates_and_extraction() 
         "https://example.test/users/alpha", "https://example.test/items/42",
         "https://example.test/users/alpha", "https://example.test/items/42",
     ]
-    assert calls[0]["json"] == {"enabled": True}
+    assert calls[0]["json"] == {"enabled": True, "sequence": 1}
+    assert calls[2]["json"] == {"enabled": True, "sequence": 2}
     assert calls[1]["json"] == {"id": 42}
     assert calls[1]["params"] == {"filter": {"active": True}}
     assert calls[1]["headers"] == {"X-Item": "42"}

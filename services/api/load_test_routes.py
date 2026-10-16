@@ -1,3 +1,4 @@
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, Response, status
@@ -6,6 +7,7 @@ from .environment_repository import EnvironmentNotFound
 from .load_test_repository import LoadTestRepository
 from .load_test_schemas import (
     LoadTestCreate, LoadTestListResponse, LoadTestResponse,
+    LoadTestResponseDetail, LoadTestResponseDetailList,
     LoadTestRunListResponse, LoadTestRunResponse, LoadTestUpdate,
 )
 from .load_test_service import LoadTestService
@@ -27,7 +29,7 @@ def get_service(request: Request) -> LoadTestService:
 
 def _values(body: LoadTestCreate | LoadTestUpdate) -> dict:
     return {
-        "name": body.name, "description": body.description,
+        "name": body.name, "description": body.description, "category": body.category,
         "targets": [target.model_dump(mode="json") for target in body.targets],
         "mode": body.mode, "request_count": body.request_count,
         "duration_seconds": body.duration_seconds, "concurrency": body.concurrency,
@@ -109,6 +111,24 @@ def list_load_test_runs(load_test_id: UUID,
 def get_load_test_run(run_id: UUID,
                       repository: LoadTestRepositoryLike = Depends(get_repository)) -> LoadTestRunResponse:
     return LoadTestRunResponse.from_record(repository.get_run(run_id))
+
+
+@load_test_run_router.get(
+    "/{run_id}/responses", response_model=LoadTestResponseDetailList,
+)
+def list_load_test_responses(
+    run_id: UUID, result: Literal["all", "successful", "failed"] = Query(default="all"),
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=20, ge=1, le=100),
+    repository: LoadTestRepositoryLike = Depends(get_repository),
+) -> LoadTestResponseDetailList:
+    successful = None if result == "all" else result == "successful"
+    records, total = repository.list_run_responses(
+        run_id, offset=offset, limit=limit, successful=successful,
+    )
+    return LoadTestResponseDetailList(
+        items=[LoadTestResponseDetail.from_record(item) for item in records],
+        total=total, offset=offset, limit=limit,
+    )
 
 
 @load_test_run_router.post(

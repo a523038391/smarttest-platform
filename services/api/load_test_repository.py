@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 from .data_factory_schemas import _bounded_json
 from .load_test_domain import (
-    LoadTestMode, LoadTestRecord, LoadTestRunRecord, LoadTestRunStatus,
+    LoadTestMode, LoadTestRecord, LoadTestResponseRecord, LoadTestRunRecord, LoadTestRunStatus,
     LoadTestTrafficMode, empty_metrics,
 )
 from .load_test_schemas import LoadTestTarget
@@ -40,6 +40,13 @@ def normalize_name(name: str) -> str:
     normalized = name.strip()
     if not normalized or len(normalized) > 255:
         raise ValueError("load test name must contain between 1 and 255 characters")
+    return normalized
+
+
+def normalize_category(category: str) -> str:
+    normalized = category.strip()
+    if len(normalized) > 100:
+        raise ValueError("load test category must contain at most 100 characters")
     return normalized
 
 
@@ -97,6 +104,7 @@ class LoadTestRepository:
         self._definitions: dict[UUID, LoadTestRecord] = {}
         self._names: dict[tuple[UUID, str], UUID] = {}
         self._runs: dict[UUID, LoadTestRunRecord] = {}
+        self._responses: dict[UUID, list[LoadTestResponseRecord]] = {}
 
     def create_load_test(self, project_id: UUID, name: str, description: str,
                          targets: Sequence[Any], mode: LoadTestMode, request_count: int,
@@ -105,11 +113,13 @@ class LoadTestRepository:
                          environment_id: UUID | None = None,
                          traffic_mode: LoadTestTrafficMode = LoadTestTrafficMode.REQUESTS,
                          initial_variables: dict[str, Any] | None = None,
-                         stop_on_failure: bool = True) -> LoadTestRecord:
+                         stop_on_failure: bool = True,
+                         category: str = "") -> LoadTestRecord:
         traffic_mode, initial_variables, stop_on_failure = normalize_scenario_settings(
             traffic_mode, initial_variables, stop_on_failure,
         )
         normalized_name = normalize_name(name)
+        normalized_category = normalize_category(category)
         normalized_targets = normalize_targets(targets, traffic_mode)
         mode = validate_settings(mode, request_count, duration_seconds, concurrency,
                                  interval_ms, timeout_seconds)
@@ -126,7 +136,7 @@ class LoadTestRepository:
                 timeout_seconds=timeout_seconds, state_version=0,
                 created_at=now, updated_at=now, environment_id=environment_id,
                 traffic_mode=traffic_mode, initial_variables=initial_variables,
-                stop_on_failure=stop_on_failure,
+                stop_on_failure=stop_on_failure, category=normalized_category,
             )
             self._definitions[record.id] = record
             self._names[key] = record.id
@@ -152,11 +162,13 @@ class LoadTestRepository:
                          environment_id: UUID | None = None,
                          traffic_mode: LoadTestTrafficMode = LoadTestTrafficMode.REQUESTS,
                          initial_variables: dict[str, Any] | None = None,
-                         stop_on_failure: bool = True) -> LoadTestRecord:
+                         stop_on_failure: bool = True,
+                         category: str = "") -> LoadTestRecord:
         traffic_mode, initial_variables, stop_on_failure = normalize_scenario_settings(
             traffic_mode, initial_variables, stop_on_failure,
         )
         normalized_name = normalize_name(name)
+        normalized_category = normalize_category(category)
         normalized_targets = normalize_targets(targets, traffic_mode)
         mode = validate_settings(mode, request_count, duration_seconds, concurrency,
                                  interval_ms, timeout_seconds)
@@ -174,7 +186,7 @@ class LoadTestRepository:
                 interval_ms=interval_ms, timeout_seconds=timeout_seconds,
                 environment_id=environment_id,
                 traffic_mode=traffic_mode, initial_variables=initial_variables,
-                stop_on_failure=stop_on_failure,
+                stop_on_failure=stop_on_failure, category=normalized_category,
             )
             self._definitions[load_test_id] = updated
             self._names.pop((current.project_id, current.name), None)
@@ -188,8 +200,12 @@ class LoadTestRepository:
                 raise LoadTestActiveRunConflict("load test has an active run")
             del self._definitions[load_test_id]
             self._names.pop((current.project_id, current.name), None)
+            removed_run_ids = {key for key, run in self._runs.items()
+                               if run.load_test_id == load_test_id}
             self._runs = {key: run for key, run in self._runs.items()
                           if run.load_test_id != load_test_id}
+            for run_id in removed_run_ids:
+                self._responses.pop(run_id, None)
 
     def create_run(self, load_test_id: UUID) -> LoadTestRunRecord:
         with self._lock:
@@ -202,7 +218,35 @@ class LoadTestRepository:
                 empty_metrics([target["name"] for target in definition.targets]), None,
             )
             self._runs[record.id] = record
+            self._responses[record.id] = []
             return deepcopy(record)
+
+    def add_run_responses(self, run_id: UUID,
+                          responses: Sequence[dict[str, Any]]) -> list[LoadTestResponseRecord]:
+        with self._lock:
+            self.get_run(run_id)
+            now = datetime.now(timezone.utc)
+            records = [LoadTestResponseRecord(
+                id=uuid4(), run_id=run_id, sequence=int(item["sequence"]),
+                target=str(item["target"]), successful=bool(item["successful"]),
+                status=item.get("status"), latency_ms=float(item["latency_ms"]),
+                error=item.get("error"), body=item.get("body"),
+                body_kind=str(item["body_kind"]), truncated=bool(item["truncated"]),
+                body_bytes=int(item["body_bytes"]), created_at=now,
+            ) for item in responses]
+            self._responses.setdefault(run_id, []).extend(records)
+            self._responses[run_id].sort(key=lambda item: item.sequence)
+            return deepcopy(records)
+
+    def list_run_responses(self, run_id: UUID, *, offset: int, limit: int,
+                           successful: bool | None = None
+                           ) -> tuple[list[LoadTestResponseRecord], int]:
+        with self._lock:
+            self.get_run(run_id)
+            items = self._responses.get(run_id, [])
+            if successful is not None:
+                items = [item for item in items if item.successful is successful]
+            return deepcopy(items[offset:offset + limit]), len(items)
 
     def update_run(self, run_id: UUID, *, status: LoadTestRunStatus,
                    metrics: dict[str, Any], error_message: str | None = None,

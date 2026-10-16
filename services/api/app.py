@@ -38,6 +38,13 @@ from .automation_sql_repository import SqlAutomationRepository
 from .ai_cases import AiCaseGenerator, CaseGenerationError, CaseGenerationUnavailable
 from .ai_routes import ai_router
 from .config import Settings
+from .connector_client import ConnectorClient
+from .connector_repository import (
+    ConnectorConflict, ConnectorCredentialRequired, ConnectorNameConflict,
+    ConnectorNotFound, ConnectorRepository, ConnectorVersionConflict,
+)
+from .connector_routes import connector_router
+from .connector_sql_repository import SqlConnectorRepository
 from .database import create_database_engine, create_session_factory
 from .dispatcher import (
     CeleryRunDispatcher,
@@ -204,6 +211,8 @@ def create_app(
     load_test_repository: LoadTestRepository | SqlLoadTestRepository | None = None,
     load_test_executor: LoadTestExecutor | None = None,
     load_test_service: LoadTestService | None = None,
+    connector_repository: ConnectorRepository | SqlConnectorRepository | None = None,
+    connector_client: ConnectorClient | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     database_engine = None
@@ -213,7 +222,7 @@ def create_app(
         or environment_repository is None or test_plan_repository is None
         or auth_repository is None or project_repository is None
         or parameter_repository is None or data_factory_repository is None
-        or load_test_repository is None
+        or load_test_repository is None or connector_repository is None
     ):
         database_engine = create_database_engine(resolved_settings.database_url)
         sessions = create_session_factory(database_engine)
@@ -236,6 +245,14 @@ def create_app(
     encryptor = SecretEncryptor(
         resolved_settings.secret_encryption_key,
         resolved_settings.secret_encryption_key_id,
+    )
+    if connector_repository is None:
+        connector_repository = (
+            SqlConnectorRepository(sessions, encryptor)
+            if sessions else ConnectorRepository(encryptor)
+        )
+    connector_client = connector_client or ConnectorClient(
+        allowed_private_hosts=resolved_settings.connector_private_host_allowlist
     )
     if environment_repository is None:
         environment_repository = (
@@ -364,6 +381,8 @@ def create_app(
     application.state.load_test_service = load_test_service
     application.state.version_control_service = version_control_service
     application.state.service_control_service = service_control_service
+    application.state.connector_repository = connector_repository
+    application.state.connector_client = connector_client
 
     @application.middleware("http")
     async def authentication_middleware(request: Request, call_next):
@@ -409,6 +428,7 @@ def create_app(
     application.include_router(run_specs_router)
     application.include_router(version_control_router)
     application.include_router(service_control_router)
+    application.include_router(connector_router)
 
     @application.exception_handler(RequestValidationError)
     async def validation_handler(
@@ -730,6 +750,36 @@ def create_app(
             request, 503, "secret_encryption_unavailable",
             "Secret encryption service is unavailable",
         )
+
+    @application.exception_handler(ConnectorNotFound)
+    async def connector_not_found_handler(
+        request: Request, exc: ConnectorNotFound
+    ) -> JSONResponse:
+        return _problem(request, 404, "connector_not_found", str(exc))
+
+    @application.exception_handler(ConnectorNameConflict)
+    async def connector_name_conflict_handler(
+        request: Request, exc: ConnectorNameConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "connector_name_conflict", str(exc))
+
+    @application.exception_handler(ConnectorVersionConflict)
+    async def connector_version_conflict_handler(
+        request: Request, exc: ConnectorVersionConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "connector_version_conflict", str(exc))
+
+    @application.exception_handler(ConnectorCredentialRequired)
+    async def connector_credential_required_handler(
+        request: Request, exc: ConnectorCredentialRequired
+    ) -> JSONResponse:
+        return _problem(request, 422, "connector_credential_required", str(exc))
+
+    @application.exception_handler(ConnectorConflict)
+    async def connector_conflict_handler(
+        request: Request, exc: ConnectorConflict
+    ) -> JSONResponse:
+        return _problem(request, 409, "connector_conflict", str(exc))
 
     @application.exception_handler(CaseGenerationUnavailable)
     async def generation_unavailable_handler(

@@ -9,6 +9,7 @@ Set-StrictMode -Version Latest
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $pythonExecutable = Join-Path $repositoryRoot '.venv\Scripts\python.exe'
 $controlRoot = Join-Path $repositoryRoot '.service-control'
+$runtimeTemp = Join-Path $repositoryRoot '.runtime-temp'
 $protectedKeyPath = Join-Path $controlRoot 'secret-encryption-key.dpapi'
 
 if (-not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
@@ -22,7 +23,14 @@ foreach ($port in @(8000, 5173)) {
     }
 }
 
-New-Item -ItemType Directory -Path $controlRoot -Force | Out-Null
+$dataDirectories = @(
+    $controlRoot,
+    $runtimeTemp,
+    (Join-Path $repositoryRoot '.artifacts'),
+    (Join-Path $repositoryRoot '.sources'),
+    (Join-Path $repositoryRoot '.runner-work')
+)
+New-Item -ItemType Directory -Path $dataDirectories -Force | Out-Null
 if (-not (Test-Path -LiteralPath $protectedKeyPath -PathType Leaf)) {
     $keyBytes = New-Object byte[] 32
     $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -46,6 +54,12 @@ try {
 $env:SECRET_ENCRYPTION_KEY_ID = 'windows-dpapi-v1'
 $env:VERSION_CONTROL_ENABLED = 'true'
 $env:VERSION_CONTROL_ROOT = $repositoryRoot
+$env:ARTIFACT_ROOT = Join-Path $repositoryRoot '.artifacts'
+$env:SOURCE_ROOT = Join-Path $repositoryRoot '.sources'
+$env:RUNNER_WORK_ROOT = Join-Path $repositoryRoot '.runner-work'
+$env:TEMP = $runtimeTemp
+$env:TMP = $runtimeTemp
+$env:TMPDIR = $runtimeTemp
 $env:RUNNER_NETWORK = 'bridge'
 $env:LOAD_TEST_PRIVATE_HOST_ALLOWLIST = 'erp-test.wecharmer.cn'
 

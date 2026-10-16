@@ -5,6 +5,7 @@ export type JsonObject = { [key: string]: JsonValue }
 export type LoadTestMode = 'COUNT' | 'DURATION'
 export type LoadTestTrafficMode = 'REQUESTS' | 'SCENARIO'
 export type LoadTestRunStatus = 'RUNNING' | 'SUCCEEDED' | 'FAILED'
+export type LoadTestResponseResult = 'all' | 'successful' | 'failed'
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS'
 
 export interface LoadTestTarget {
@@ -25,6 +26,7 @@ export interface LoadTestDefinition {
   environment_id: string | null
   name: string
   description: string
+  category: string
   targets: LoadTestTarget[]
   traffic_mode: LoadTestTrafficMode
   initial_variables: JsonObject
@@ -45,6 +47,7 @@ export interface LoadTestCreateInput {
   environment_id: string | null
   name: string
   description: string
+  category: string
   targets: LoadTestTarget[]
   traffic_mode: LoadTestTrafficMode
   initial_variables: JsonObject
@@ -117,4 +120,27 @@ export interface LoadTestRun {
   finished_at: string | null
   metrics: LoadTestMetrics | null
   error_message: string | null
+}
+
+export interface LoadTestResponseDetail {
+  id: string
+  run_id: string
+  sequence: number
+  target: string
+  successful: boolean
+  status: number | null
+  latency_ms: number
+  error: string | null
+  body: string | null
+  body_kind: 'json' | 'text' | 'empty' | 'binary' | 'unavailable'
+  truncated: boolean
+  body_bytes: number
+  created_at: string
+}
+
+export interface LoadTestResponsePage {
+  items: LoadTestResponseDetail[]
+  total: number
+  offset: number
+  limit: number
 }

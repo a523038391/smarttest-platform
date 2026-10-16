@@ -1,7 +1,8 @@
 import type {
   HttpMethod, JsonObject, JsonValue, LoadTestCreateInput, LoadTestDefinition,
-  LoadTestMetrics, LoadTestMode, LoadTestResponseSample, LoadTestRun, LoadTestRunStatus, LoadTestTarget,
-  LoadTestTrafficMode, LoadTestUpdateInput,
+  LoadTestMetrics, LoadTestMode, LoadTestResponseDetail, LoadTestResponsePage,
+  LoadTestResponseResult, LoadTestResponseSample, LoadTestRun, LoadTestRunStatus,
+  LoadTestTarget, LoadTestTrafficMode, LoadTestUpdateInput,
 } from '../types/load-testing'
 
 type UnknownRecord = Record<string, unknown>
@@ -87,14 +88,16 @@ function parseDefinition(value: unknown): LoadTestDefinition | null {
   const trafficMode = value.traffic_mode === undefined ? 'REQUESTS' : value.traffic_mode
   const initialVariables = value.initial_variables === undefined ? {} : value.initial_variables
   const stopOnFailure = value.stop_on_failure === undefined ? true : value.stop_on_failure
+  const category = value.category === undefined ? '' : value.category
   if (!trafficModes.includes(trafficMode as LoadTestTrafficMode)
-    || !isJsonObject(initialVariables) || typeof stopOnFailure !== 'boolean') return null
+    || !isJsonObject(initialVariables) || typeof stopOnFailure !== 'boolean'
+    || typeof category !== 'string') return null
   const targets = value.targets.map(parseTarget)
   if (targets.some((target) => target === null)) return null
   return { id: value.id, project_id: value.project_id,
     environment_id: value.environment_id as string | null,
     name: value.name,
-    description: value.description, targets: targets as LoadTestTarget[],
+    description: value.description, category, targets: targets as LoadTestTarget[],
     traffic_mode: trafficMode as LoadTestTrafficMode,
     initial_variables: initialVariables, stop_on_failure: stopOnFailure,
     mode: value.mode as LoadTestMode, request_count: value.request_count,
@@ -181,6 +184,26 @@ function parseRun(value: unknown): LoadTestRun | null {
     status: value.status as LoadTestRunStatus, mode: value.mode as LoadTestMode,
     started_at: value.started_at, finished_at: value.finished_at,
     metrics, error_message: value.error_message }
+}
+
+function parseResponseDetail(value: unknown): LoadTestResponseDetail | null {
+  const bodyKinds = ['json', 'text', 'empty', 'binary', 'unavailable']
+  if (!isRecord(value) || typeof value.id !== 'string' || !value.id
+    || typeof value.run_id !== 'string' || !value.run_id || !isInteger(value.sequence, 1)
+    || typeof value.target !== 'string' || !value.target || typeof value.successful !== 'boolean'
+    || !(value.status === null || (isInteger(value.status, 100) && value.status <= 599))
+    || !isFiniteNumber(value.latency_ms) || !(value.error === null || typeof value.error === 'string')
+    || !(value.body === null || typeof value.body === 'string')
+    || !bodyKinds.includes(value.body_kind as string) || typeof value.truncated !== 'boolean'
+    || !isInteger(value.body_bytes, 0) || !isDateTime(value.created_at)) return null
+  return {
+    id: value.id, run_id: value.run_id, sequence: value.sequence, target: value.target,
+    successful: value.successful, status: value.status as number | null,
+    latency_ms: value.latency_ms, error: value.error as string | null,
+    body: value.body as string | null,
+    body_kind: value.body_kind as LoadTestResponseDetail['body_kind'],
+    truncated: value.truncated, body_bytes: value.body_bytes, created_at: value.created_at,
+  }
 }
 
 async function httpError(response: Response): Promise<Error> {
@@ -274,6 +297,25 @@ export async function fetchLoadTestRuns(id: string, signal?: AbortSignal): Promi
 
 export async function getLoadTestRun(runId: string, signal?: AbortSignal): Promise<LoadTestRun> {
   return readRun(await request(`/api/v1/load-test-runs/${encodeURIComponent(runId)}`, { signal }), '读取压测结果')
+}
+
+export async function fetchLoadTestResponses(runId: string, result: LoadTestResponseResult,
+  offset: number, limit: number, signal?: AbortSignal): Promise<LoadTestResponsePage> {
+  const params = new URLSearchParams({ result, offset: String(offset), limit: String(limit) })
+  const response = await request(
+    `/api/v1/load-test-runs/${encodeURIComponent(runId)}/responses?${params}`, { signal },
+  )
+  const payload: unknown = await response.json().catch(() => {
+    throw new Error('响应明细未返回有效 JSON')
+  })
+  if (!isRecord(payload) || !Array.isArray(payload.items) || !isInteger(payload.total, 0)
+    || !isInteger(payload.offset, 0) || !isInteger(payload.limit, 1)) {
+    throw new Error('响应明细格式暂不支持')
+  }
+  const items = payload.items.map(parseResponseDetail)
+  if (items.some((item) => item === null)) throw new Error('响应明细字段格式暂不支持')
+  return { items: items as LoadTestResponseDetail[], total: payload.total,
+    offset: payload.offset, limit: payload.limit }
 }
 
 export function getLoadTestingErrorMessage(reason: unknown): string {

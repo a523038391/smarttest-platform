@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from pathlib import Path
 
 
@@ -33,6 +34,14 @@ def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean")
+
+
+def _ip_literal(value: str) -> bool:
+    try:
+        ip_address(value)
+        return True
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +77,7 @@ class Settings:
     service_control_root: str | None = None
     version_control_auto_restart: bool = False
     load_test_private_host_allowlist: tuple[str, ...] = ()
+    connector_private_host_allowlist: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         configured_text = {
@@ -167,6 +177,15 @@ class Settings:
             raise ValueError(
                 "LOAD_TEST_PRIVATE_HOST_ALLOWLIST must contain lowercase hostnames"
             )
+        if any(
+            not isinstance(host, str) or host != host.strip().lower()
+            or not _HOSTNAME.fullmatch(host) or host == "localhost" or _ip_literal(host)
+            or not any(character.isalpha() for character in host)
+            for host in self.connector_private_host_allowlist
+        ):
+            raise ValueError(
+                "CONNECTOR_PRIVATE_HOST_ALLOWLIST must contain lowercase hostnames"
+            )
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -247,6 +266,11 @@ class Settings:
             load_test_private_host_allowlist=tuple(
                 host.strip().lower()
                 for host in env.get("LOAD_TEST_PRIVATE_HOST_ALLOWLIST", "").split(",")
+                if host.strip()
+            ),
+            connector_private_host_allowlist=tuple(
+                host.strip().lower()
+                for host in env.get("CONNECTOR_PRIVATE_HOST_ALLOWLIST", "").split(",")
                 if host.strip()
             ),
         )

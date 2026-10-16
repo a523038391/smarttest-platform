@@ -47,3 +47,23 @@ def test_secret_encryption_rejects_tampering_and_wrong_aad_generically() -> None
         encryptor.decrypt(tampered, **arguments)
     with pytest.raises(SecretDecryptionError, match="secret value is unavailable"):
         encryptor.decrypt(encrypted, **(arguments | {"name": "other"}))
+
+
+def test_connector_secret_is_bound_to_connector_and_secret_revision() -> None:
+    encryptor = SecretEncryptor(b"k" * 32, "test-key")
+    connector_id = uuid4()
+    encrypted = encryptor.encrypt_connector(
+        "credential", connector_id=connector_id, secret_revision=3,
+    )
+
+    assert encryptor.decrypt_connector(
+        encrypted, connector_id=connector_id, secret_revision=3,
+    ) == "credential"
+    with pytest.raises(SecretDecryptionError, match="secret value is unavailable"):
+        encryptor.decrypt_connector(
+            encrypted, connector_id=uuid4(), secret_revision=3,
+        )
+    with pytest.raises(SecretDecryptionError, match="secret value is unavailable"):
+        encryptor.decrypt_connector(
+            encrypted, connector_id=connector_id, secret_revision=4,
+        )

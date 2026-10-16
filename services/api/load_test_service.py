@@ -78,6 +78,8 @@ class LoadTestService:
     def _execute(self, run_id: UUID, definition, cancellation: Event) -> None:
         latest_metrics = self._repository.get_run(run_id).metrics
         snapshot_lock = Lock()
+        response_lock = Lock()
+        pending_responses: list[dict] = []
 
         def snapshot(metrics: dict) -> None:
             nonlocal latest_metrics
@@ -90,6 +92,21 @@ class LoadTestService:
                 )
                 latest_metrics = metrics
 
+        def responses(item: dict) -> None:
+            with response_lock:
+                pending_responses.append(item)
+                if len(pending_responses) >= 50:
+                    batch = pending_responses[:]
+                    pending_responses.clear()
+                    self._repository.add_run_responses(run_id, batch)
+
+        def flush_responses() -> None:
+            with response_lock:
+                if pending_responses:
+                    batch = pending_responses[:]
+                    pending_responses.clear()
+                    self._repository.add_run_responses(run_id, batch)
+
         try:
             auth_config = (
                 self._auth_resolver.resolve(definition.project_id, definition.environment_id)
@@ -97,8 +114,9 @@ class LoadTestService:
             )
             metrics = self._executor.execute(
                 definition, cancel_event=cancellation, snapshot_callback=snapshot,
-                auth_config=auth_config,
+                auth_config=auth_config, response_callback=responses,
             )
+            flush_responses()
             status = (LoadTestRunStatus.FAILED if cancellation.is_set()
                       else LoadTestRunStatus.SUCCEEDED)
             self._repository.update_run(
@@ -107,11 +125,13 @@ class LoadTestService:
                 finished_at=datetime.now(timezone.utc),
             )
         except LoadTestExecutionError as exc:
+            flush_responses()
             self._repository.update_run(
                 run_id, status=LoadTestRunStatus.FAILED, metrics=latest_metrics,
                 error_message=str(exc), finished_at=datetime.now(timezone.utc),
             )
         except Exception:
+            flush_responses()
             self._repository.update_run(
                 run_id, status=LoadTestRunStatus.FAILED, metrics=latest_metrics,
                 error_message="Load test execution failed",

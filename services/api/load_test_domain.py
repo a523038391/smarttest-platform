@@ -60,6 +60,7 @@ class LoadTestRecord:
     traffic_mode: LoadTestTrafficMode = LoadTestTrafficMode.REQUESTS
     initial_variables: dict[str, Any] = field(default_factory=dict)
     stop_on_failure: bool = True
+    category: str = ""
 
     def updated(self, **changes: Any) -> "LoadTestRecord":
         return replace(
@@ -78,3 +79,20 @@ class LoadTestRunRecord:
     finished_at: datetime | None
     metrics: dict[str, Any]
     error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class LoadTestResponseRecord:
+    id: UUID
+    run_id: UUID
+    sequence: int
+    target: str
+    successful: bool
+    status: int | None
+    latency_ms: float
+    error: str | None
+    body: str | None
+    body_kind: str
+    truncated: bool
+    body_bytes: int
+    created_at: datetime
